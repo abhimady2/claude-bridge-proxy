@@ -17,7 +17,16 @@ if sys.stderr is None:
 from PIL import Image, ImageDraw
 import pystray
 
-from proxy_engine import ProxyServer
+from proxy_engine import (
+    ProxyServer,
+    fetch_context_length,
+    DEFAULT_CONTEXT_LENGTH,
+    get_token_stats,
+    reset_token_stats,
+)
+
+# Bumped with every behaviour change. Shown in the title bar and logged on start.
+APP_VERSION = "1.1.0"
 
 # Configuration paths
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ClaudeBridge")
@@ -80,7 +89,9 @@ def get_default_config():
         "port": 4000,
         "minimize_to_tray": False,
         "auto_start": True,
-        "thinking_mode": "thinking_block"
+        "thinking_mode": "thinking_block",
+        "context_length": DEFAULT_CONTEXT_LENGTH,
+        "auto_compact_window": True
     }
 
 
@@ -94,7 +105,8 @@ def load_config():
                     defaults["providers"].update(data["providers"])
                 if "active_provider" in data and data["active_provider"] in defaults["providers"]:
                     defaults["active_provider"] = data["active_provider"]
-                for k in ("port", "minimize_to_tray", "auto_start", "thinking_mode"):
+                for k in ("port", "minimize_to_tray", "auto_start", "thinking_mode",
+                          "context_length", "auto_compact_window"):
                     if k in data:
                         defaults[k] = data[k]
         except Exception:
@@ -134,7 +146,7 @@ def create_tray_image(is_running=False):
 class ClaudeBridgeApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Claude Bridge — Multi-Provider Router Proxy")
+        self.root.title(f"Claude Bridge v{APP_VERSION} — Multi-Provider Router Proxy")
         self.root.geometry("660 x 820".replace(" ", ""))
         self.root.minsize(600, 740)
         self.root.configure(bg="#18181b")
@@ -344,6 +356,47 @@ class ClaudeBridgeApp:
         self.haiku_var = tk.StringVar(value=cur_p_data.get("haiku_model", "zai-org/GLM-5.3-Flash"))
         tk.Entry(h_row, textvariable=self.haiku_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
 
+        # Context Window (autodetected from the provider; user-editable)
+        ctx_frame = tk.Frame(card, bg="#27272a")
+        ctx_frame.pack(fill="x", pady=3)
+
+        ctx_head = tk.Frame(ctx_frame, bg="#27272a")
+        ctx_head.pack(fill="x")
+        ttk.Label(ctx_head, text="Context Window (tokens):", style="FieldLabel.TLabel").pack(side="left")
+
+        self.auto_ctx_var = tk.BooleanVar(value=self.cfg.get("auto_compact_window", True))
+        auto_ctx_check = tk.Checkbutton(
+            ctx_head, text="Apply to Claude Code (auto-compact at this limit)",
+            variable=self.auto_ctx_var,
+            bg="#27272a", fg="#a1a1aa", activebackground="#27272a", selectcolor="#18181b",
+            relief="flat", font=("Segoe UI", 8)
+        )
+        auto_ctx_check.pack(side="right")
+
+        ctx_row = tk.Frame(ctx_frame, bg="#27272a")
+        ctx_row.pack(fill="x", pady=(2, 0))
+
+        self.ctx_var = tk.StringVar(value=str(self.cfg.get("context_length", DEFAULT_CONTEXT_LENGTH)))
+        self.ctx_entry = tk.Entry(
+            ctx_row, textvariable=self.ctx_var, width=14, font=("Segoe UI", 10), justify="center",
+            bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat",
+            highlightbackground="#52525b", highlightthickness=1
+        )
+        self.ctx_entry.pack(side="left", ipady=4)
+        self.ctx_entry.bind("<FocusOut>", lambda e: self._normalize_ctx_entry())
+
+        self.ctx_source_lbl = tk.Label(
+            ctx_row, text="", font=("Segoe UI", 8), bg="#27272a", fg="#71717a"
+        )
+        self.ctx_source_lbl.pack(side="left", padx=(8, 0))
+
+        fetch_ctx_btn = tk.Button(
+            ctx_row, text="🔄 Auto-detect", command=self.fetch_context_length,
+            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", activebackground="#52525b",
+            activeforeground="#ffffff", relief="flat", padx=8, pady=2, cursor="hand2"
+        )
+        fetch_ctx_btn.pack(side="right")
+
         # Thinking & Reasoning Handling inside card
         t_row = tk.Frame(card, bg="#27272a")
         t_row.pack(fill="x", pady=(8, 2))
@@ -439,6 +492,27 @@ class ClaudeBridgeApp:
         )
         clear_btn.pack(side="right")
 
+        # Token Counter Bar
+        token_frame = tk.Frame(main_frame, bg="#27272a", padx=12, pady=6, highlightbackground="#3f3f46", highlightthickness=1)
+        token_frame.pack(fill="x", pady=(0, 8))
+
+        tk.Label(
+            token_frame, text="Tokens:", font=("Segoe UI", 9, "bold"), bg="#27272a", fg="#60a5fa"
+        ).pack(side="left", padx=(0, 8))
+
+        self.token_display = tk.Label(
+            token_frame, text="↑ 0 · ↓ 0 · Σ 0 · 0 reqs", font=("Segoe UI", 9),
+            bg="#27272a", fg="#d4d4d8"
+        )
+        self.token_display.pack(side="left")
+
+        reset_tokens_btn = tk.Button(
+            token_frame, text="↺ Reset", command=self.reset_token_counter,
+            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", activebackground="#52525b",
+            activeforeground="#ffffff", relief="flat", padx=8, pady=2, cursor="hand2"
+        )
+        reset_tokens_btn.pack(side="right")
+
         # Activity Log Console
         log_frame = tk.Frame(main_frame, bg="#27272a", highlightbackground="#3f3f46", highlightthickness=1)
         log_frame.pack(fill="both", expand=True)
@@ -450,11 +524,35 @@ class ClaudeBridgeApp:
         self.log_area.pack(fill="both", expand=True)
         self.log_area.configure(state="disabled")
 
-        self.log("Claude Bridge initialized. Ready to start.")
-        
+        self.log(f"Claude Bridge v{APP_VERSION} initialized. Ready to start.")
+
+        # ponytail: 2s poll of a module-level dict. No per-request work and no
+        # second event loop; the cost is one label update per tick.
+        self._refresh_token_display()
+        self.root.after(2000, self._poll_tokens)
+
         # Auto-start if enabled
         if self.cfg.get("auto_start", True):
             self.root.after(300, self.start_proxy)
+
+    def _refresh_token_display(self):
+        s = get_token_stats()
+        self.token_display.configure(
+            text=f"↑ {s['input']:,} · ↓ {s['output']:,} · Σ {s['total']:,} · {s['requests']} reqs"
+        )
+
+    def _poll_tokens(self):
+        """Background token counter refresh. Re-arms itself until the window dies."""
+        try:
+            self._refresh_token_display()
+        except Exception:
+            return
+        self.root.after(2000, self._poll_tokens)
+
+    def reset_token_counter(self):
+        reset_token_stats()
+        self._refresh_token_display()
+        self.log("Token counter reset to zero.")
 
     def _on_provider_selected(self, event=None):
         p_name = self.provider_var.get()
@@ -472,6 +570,54 @@ class ClaudeBridgeApp:
         self.cfg["active_provider"] = p_name
         save_config(self.cfg)
         self.log(f"Switched provider profile to: {p_name} ({p_data.get('router_url')})")
+
+        # Context window depends on the model, so re-resolve for the new profile.
+        if self.auto_ctx_var.get():
+            self.fetch_context_length()
+
+    def _normalize_ctx_entry(self):
+        """Clamp whatever the user typed to a sane positive int, defaulting on junk."""
+        try:
+            value = int(self.ctx_var.get().strip())
+        except (TypeError, ValueError):
+            value = DEFAULT_CONTEXT_LENGTH
+        if not isinstance(value, int) or value <= 0:
+            value = DEFAULT_CONTEXT_LENGTH
+        self.ctx_var.set(str(value))
+        return value
+
+    def get_context_length(self):
+        return self._normalize_ctx_entry()
+
+    def fetch_context_length(self):
+        """Resolve the context window for the currently selected model and fill the field."""
+        model = self.model_var.get().strip()
+        router_url = self.url_var.get().strip()
+        if not model or not router_url:
+            return
+
+        self.ctx_source_lbl.configure(text="detecting…", fg="#a1a1aa")
+        self.root.update_idletasks()
+
+        length = fetch_context_length(router_url, self.key_var.get().strip(), model)
+
+        # A value the user set by hand wins over detection; only overwrite when
+        # detection actually knows something the static default doesn't.
+        if length == DEFAULT_CONTEXT_LENGTH:
+            stored = self.cfg.get("context_length")
+            if isinstance(stored, int) and stored > 0 and stored != DEFAULT_CONTEXT_LENGTH:
+                self.ctx_source_lbl.configure(
+                    text=f"manual {stored:,} kept (router has no data for {model})", fg="#71717a"
+                )
+                return
+
+        self.ctx_var.set(str(length))
+        self.ctx_source_lbl.configure(
+            text=(f"{length:,} for {model}" if length != DEFAULT_CONTEXT_LENGTH
+                  else f"{length:,} default (router did not report)"),
+            fg="#71717a"
+        )
+        self.log(f"Context window for {model}: {length:,} tokens")
 
     def _get_thinking_mode_key(self):
         val = self.thinking_mode_var.get()
@@ -506,6 +652,8 @@ class ClaudeBridgeApp:
         self.cfg["minimize_to_tray"] = self.min_on_close_var.get()
         self.cfg["auto_start"] = self.auto_start_var.get()
         self.cfg["thinking_mode"] = self._get_thinking_mode_key()
+        self.cfg["context_length"] = self.get_context_length()
+        self.cfg["auto_compact_window"] = self.auto_ctx_var.get()
         save_config(self.cfg)
 
     def save_current_provider(self):
@@ -603,7 +751,9 @@ class ClaudeBridgeApp:
             "port": self.port_var.get(),
             "minimize_to_tray": self.min_on_close_var.get(),
             "auto_start": self.auto_start_var.get(),
-            "thinking_mode": self._get_thinking_mode_key()
+            "thinking_mode": self._get_thinking_mode_key(),
+            "context_length": self.get_context_length(),
+            "auto_compact_window": self.auto_ctx_var.get()
         }
 
     def toggle_proxy(self):
@@ -693,10 +843,29 @@ class ClaudeBridgeApp:
             settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = cfg["sonnet_model"]
             settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = cfg["haiku_model"]
 
+            # Auto-compact: CLAUDE_CODE_MAX_CONTEXT_TOKENS is only honored when
+            # DISABLE_COMPACT is set, and it only raises the *ceiling* — Claude Code
+            # still won't trigger compaction on its own. The two keys that actually
+            # make it compact at this limit are autoCompactWindow (threshold) and
+            # CLAUDE_CODE_AUTO_COMPACT_WINDOW (same value as env override).
+            context_length = cfg["context_length"]
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_length)
+            settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(context_length)
+            settings["env"].pop("DISABLE_COMPACT", None)
+            if cfg.get("auto_compact_window", True):
+                settings["autoCompactWindow"] = context_length
+            else:
+                settings.pop("autoCompactWindow", None)
+
             with open(CLAUDE_SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(settings, f, indent=2)
 
             self.log(f"Updated Claude Code settings for provider [{self.provider_var.get()}].")
+            compact_note = (
+                f"Auto-compact at {context_length:,} tokens (matches this model's context window)."
+                if cfg.get("auto_compact_window", True) else
+                "Auto-compact disabled — Claude Code will use its own defaults."
+            )
             messagebox.showinfo(
                 "Claude Code Configured",
                 f"Claude Code settings updated successfully!\n\n"
@@ -706,6 +875,7 @@ class ClaudeBridgeApp:
                 f"Opus: {cfg['opus_model']}\n"
                 f"Haiku: {cfg['haiku_model']}\n"
                 f"Custom: {cfg['model']}\n\n"
+                f"{compact_note}\n\n"
                 f"Claude Code is now connected through Claude Bridge!"
             )
         except Exception as e:
@@ -725,13 +895,15 @@ class ClaudeBridgeApp:
                     with open(CLAUDE_SETTINGS_PATH, "r", encoding="utf-8") as f:
                         settings = json.load(f)
                     if "env" in settings:
-                        settings["env"].pop("ANTHROPIC_BASE_URL", None)
-                        settings["env"].pop("CLAUDE_CODE_USE_AUTH_TOKEN", None)
-                        settings["env"].pop("ANTHROPIC_AUTH_TOKEN", None)
-                        settings["env"].pop("ANTHROPIC_MODEL", None)
-                        settings["env"].pop("ANTHROPIC_DEFAULT_OPUS_MODEL", None)
-                        settings["env"].pop("ANTHROPIC_DEFAULT_SONNET_MODEL", None)
-                        settings["env"].pop("ANTHROPIC_DEFAULT_HAIKU_MODEL", None)
+                        for k in (
+                            "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_AUTH_TOKEN",
+                            "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                            "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                        ):
+                            settings["env"].pop(k, None)
+                    settings.pop("autoCompactWindow", None)
                     with open(CLAUDE_SETTINGS_PATH, "w", encoding="utf-8") as f:
                         json.dump(settings, f, indent=2)
                 self.log("Cleared Claude Bridge overrides from settings.json.")

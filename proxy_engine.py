@@ -74,6 +74,117 @@ def _close_client():
             _client.close()
             _client = None
 
+
+# --- Token accounting ---------------------------------------------------------
+# ponytail: module-level counters read by the UI. ProxyRequestHandler instances
+# are created per request, so an instance field would reset every time.
+_tokens_in = 0
+_tokens_out = 0
+_requests = 0
+_token_lock = threading.Lock()
+
+
+def add_tokens(input_tokens, output_tokens):
+    """Accumulate usage from a completed request. Called on the request thread."""
+    global _tokens_in, _tokens_out, _requests
+    if not isinstance(input_tokens, (int, float)) and input_tokens is not None:
+        return
+    with _token_lock:
+        if input_tokens:
+            _tokens_in += int(input_tokens)
+        if output_tokens:
+            _tokens_out += int(output_tokens)
+        _requests += 1
+
+
+def get_token_stats():
+    with _token_lock:
+        return {"input": _tokens_in, "output": _tokens_out,
+                "total": _tokens_in + _tokens_out, "requests": _requests}
+
+
+def reset_token_stats():
+    global _tokens_in, _tokens_out, _requests
+    with _token_lock:
+        _tokens_in = 0
+        _tokens_out = 0
+        _requests = 0
+
+
+# --- Context window resolution ------------------------------------------------
+# Only some routers (OpenRouter) report context_length in /v1/models. The others
+# return a bare id list, so a static table is the source of truth for them and
+# DEFAULT_CONTEXT_LENGTH is the editable last resort.
+DEFAULT_CONTEXT_LENGTH = 256000
+
+# ponytail: hardcoded for models the routers won't describe. Wrong numbers here
+# are worse than the default, so this only holds values verified against the
+# vendor's own docs; anything uncertain falls through to the fetch/default.
+KNOWN_CONTEXT_LENGTHS = (
+    ("atria", 256000),
+    ("claude-", 200000),
+)
+
+_context_cache = {}
+_context_cache_lock = threading.Lock()
+
+
+def _lookup_known_context(model):
+    m = (model or "").strip().lower()
+    if not m:
+        return None
+    for prefix, length in KNOWN_CONTEXT_LENGTHS:
+        if prefix in m:
+            return length
+    return None
+
+
+def fetch_context_length(router_url, api_key, model, timeout=8.0):
+    """Best-effort context window in tokens for `model` at `router_url`.
+
+    Never raises: returns DEFAULT_CONTEXT_LENGTH when the value is unknown, so
+    callers always have a number to write into Claude Code settings.
+    """
+    cache_key = (router_url, model)
+    with _context_cache_lock:
+        if cache_key in _context_cache:
+            return _context_cache[cache_key]
+
+    resolved = _lookup_known_context(model)
+    if resolved is None:
+        # Ask the router. Most return no context_length; 401/404/timeout just
+        # fall through to the default.
+        try:
+            base = router_url.rstrip("/")
+            if not base.endswith("/models"):
+                base = f"{base}/models"
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            with httpx.Client(timeout=timeout) as probe:
+                resp = probe.get(base, headers=headers)
+            if resp.status_code == 200:
+                payload = resp.json()
+                items = payload.get("data") or payload.get("models") or []
+                wanted = (model or "").strip().lower()
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("id", "").strip().lower() != wanted:
+                        continue
+                    length = item.get("context_length") or item.get("max_context_length")
+                    if isinstance(length, int) and length > 0:
+                        resolved = length
+                    break
+        except Exception:
+            resolved = None
+
+    if not resolved:
+        resolved = DEFAULT_CONTEXT_LENGTH
+
+    with _context_cache_lock:
+        _context_cache[cache_key] = resolved
+    return resolved
+
+
 def convert_anthropic_to_openai(anthropic_body, target_model):
     """
     Translates Anthropic Messages API request format to OpenAI Chat Completions format.
@@ -205,8 +316,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        if self.path == "/tokens":
+            payload = json.dumps(get_token_stats()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         if self.path.startswith("/v1/models"):
             cfg = self.config_getter() if self.config_getter else {}
+            router_url = cfg.get("router_url", "https://inference.dahl.global/v1")
             models_list = [
                 cfg.get("model", "deepseek-ai/DeepSeek-V4-Flash-0731"),
                 cfg.get("sonnet_model", "deepseek-ai/DeepSeek-V4-Flash-0731"),
@@ -221,7 +343,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             for m in models_list:
                 if m and m not in seen:
                     seen.add(m)
-                    items.append({"id": m, "object": "model"})
+                    items.append({
+                        "id": m,
+                        "object": "model",
+                        "context_length": fetch_context_length(router_url, cfg.get("api_key", ""), m)
+                    })
             payload = json.dumps({"data": items}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -287,6 +413,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
                     is_filtering_billing = False
                     ignoring_thinking = False
+                    stream_in = 0
+                    stream_out = 0
                     for line in resp.iter_lines():
                         if line.startswith("event: billing_summary"):
                             is_filtering_billing = True
@@ -295,6 +423,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             if not line.strip():
                                 is_filtering_billing = False
                             continue
+
+                        # Anthropic-native SSE: usage arrives on message_start /
+                        # message_delta data lines.
+                        if line.startswith("data:"):
+                            try:
+                                d = json.loads(line[5:].strip())
+                                u = d.get("message", {}).get("usage") or d.get("usage")
+                                if isinstance(u, dict):
+                                    stream_in += u.get("input_tokens", 0) or 0
+                                    stream_out += u.get("output_tokens", 0) or 0
+                            except Exception:
+                                pass
 
                         # If user requested hiding/stripping thinking
                         if thinking_mode == "strip":
@@ -324,6 +464,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             self.wfile.flush()
                         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                             break
+                    add_tokens(stream_in, stream_out)
                     self.emit_log("Response successfully streamed to Claude.")
 
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -366,6 +507,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             try:
                 resp = client.messages.create(**req_dict, stream=False)
                 payload = resp.model_dump_json().encode("utf-8")
+                # resp.usage is validated SDK output, so it is trusted-shape here.
+                usage = getattr(resp, "usage", None)
+                add_tokens(
+                    getattr(usage, "input_tokens", 0),
+                    getattr(usage, "output_tokens", 0),
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(payload)))
@@ -543,6 +690,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     current_block_index = 0
                     has_tools = False
                     in_think_tag = False
+                    stream_in = 0
+                    stream_out = 0
 
                     for line in resp.iter_lines():
                         line = line.strip()
@@ -556,6 +705,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             chunk = json.loads(data_str)
                         except Exception:
                             continue
+
+                        # Usage may arrive on the final chunk (usage field) or on a
+                        # dedicated [DONE] sentinel line; accumulate whichever appears.
+                        if chunk.get("usage"):
+                            u = chunk["usage"]
+                            stream_in += u.get("prompt_tokens", 0) or 0
+                            stream_out += u.get("completion_tokens", 0) or 0
 
                         choices = chunk.get("choices", [])
                         if not choices:
@@ -833,6 +989,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     # Message stop
                     self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
                     self.wfile.flush()
+                    add_tokens(stream_in, stream_out)
                     self.emit_log(f"Response successfully streamed to Claude ({'Tool use' if has_tools else 'Text'})")
 
             else:
@@ -902,6 +1059,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         "output_tokens": oresp.get("usage", {}).get("completion_tokens", 0)
                     }
                 }
+                usage = oresp.get("usage", {})
+                add_tokens(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
                 payload = json.dumps(anthropic_resp).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

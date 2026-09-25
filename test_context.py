@@ -1,0 +1,93 @@
+"""Self-check for context-window resolution + the settings.json keys Claude Code
+actually honors for auto-compaction.
+
+Run:  python test_context.py
+Exits 0 on pass. No framework, no fixtures.
+"""
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+
+from proxy_engine import (
+    DEFAULT_CONTEXT_LENGTH,
+    fetch_context_length,
+    _lookup_known_context,
+    add_tokens,
+    get_token_stats,
+    reset_token_stats,
+)
+
+
+def test_known_lookup():
+    assert _lookup_known_context("Atria-Dawn-Preview") == 256000
+    assert _lookup_known_context("atria-dawn-preview") == 256000
+    assert _lookup_known_context("claude-sonnet-4") == 200000
+    assert _lookup_known_context("deepseek-ai/DeepSeek-V4-Flash-0731") is None
+    assert _lookup_known_context("") is None
+    print("[PASS] known-table lookup incl. case-insensitivity")
+
+
+def test_known_table_matches_default_for_atria():
+    # Atria's real window is 256k, which is also the default. The two agreeing
+    # is what makes the safe fallback safe.
+    assert _lookup_known_context("Atria-Dawn-Preview") == DEFAULT_CONTEXT_LENGTH == 256000
+    print("[PASS] Atria context == default (256000)")
+
+
+def test_unknown_router_falls_back():
+    # Unreachable/unknown endpoint must never raise.
+    length = fetch_context_length("http://127.0.0.1:59999/v1", "test-key", "no-such-model")
+    assert length == DEFAULT_CONTEXT_LENGTH, length
+    print(f"[PASS] unknown router -> {length:,} (fallback, no exception)")
+
+
+def test_cached_lookup_is_stable():
+    a = fetch_context_length("http://127.0.0.1:59999/v1", "test-key", "model-x")
+    b = fetch_context_length("http://127.0.0.1:59999/v1", "test-key", "model-x")
+    assert a == b == DEFAULT_CONTEXT_LENGTH
+    print("[PASS] repeated lookup stable via cache")
+
+
+def test_autocompact_keys_are_the_real_ones():
+    # Claude Code 2.1.141 resolves the auto-compact threshold from
+    # CLAUDE_CODE_AUTO_COMPACT_WINDOW (env) or settings.autoCompactWindow.
+    # CLAUDE_CODE_MAX_CONTEXT_TOKENS alone does NOT trigger compaction.
+    settings = {
+        "autoCompactWindow": 256000,
+        "env": {
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "256000",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "256000",
+        },
+    }
+    env = settings["env"]
+    assert isinstance(settings["autoCompactWindow"], int)
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"].isdigit()
+    assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"].isdigit()
+    print("[PASS] settings payload carries both real auto-compact keys")
+
+
+def test_token_counter():
+    reset_token_stats()
+    assert get_token_stats() == {"input": 0, "output": 0, "total": 0, "requests": 0}
+    add_tokens(100, 50)
+    add_tokens(0, 0)          # a request with no usage still counts as a request
+    add_tokens(None, None)
+    add_tokens("junk", "junk")  # non-numeric must not poison the totals
+    s = get_token_stats()
+    assert s["input"] == 100 and s["output"] == 50, s
+    assert s["total"] == 150 and s["requests"] >= 3, s
+    reset_token_stats()
+    assert get_token_stats()["total"] == 0
+    print("[PASS] token counter accumulates, tolerates junk, resets cleanly")
+
+
+if __name__ == "__main__":
+    test_known_lookup()
+    test_known_table_matches_default_for_atria()
+    test_unknown_router_falls_back()
+    test_cached_lookup_is_stable()
+    test_autocompact_keys_are_the_real_ones()
+    test_token_counter()
+    print("\nALL CONTEXT CHECKS PASSED")

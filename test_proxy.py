@@ -9,7 +9,7 @@ import time
 import urllib.request
 import http.server
 
-from proxy_engine import ProxyServer
+from proxy_engine import ProxyServer, get_token_stats, reset_token_stats
 
 PROXY_PORT = 4199
 ROUTER_PORT = 4198
@@ -206,6 +206,31 @@ def main():
     except urllib.error.HTTPError as e:
         check("404_raised", e.code == 404)
 
+    # --- 8. token accounting on non-streaming (router reports usage)
+    reset_token_stats()
+    for i in range(3):
+        rq = urllib.request.Request(
+            f"http://127.0.0.1:{PROXY_PORT}/v1/messages",
+            data=json.dumps({
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": f"count {i}"}],
+                "stream": False,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(rq, timeout=15) as r:
+            json.loads(r.read())
+    s = get_token_stats()
+    # FakeRouter reports 7 prompt + 3 completion tokens per request.
+    check("tokens_counted", s["input"] == 21 and s["output"] == 9, str(s))
+    check("token_request_count", s["requests"] >= 3, str(s))
+
+    # --- 9. /tokens endpoint must expose the same numbers the UI shows
+    with urllib.request.urlopen(f"http://127.0.0.1:{PROXY_PORT}/tokens", timeout=5) as r:
+        endpoint_stats = json.loads(r.read())
+    check("tokens_endpoint", endpoint_stats == s, f"{endpoint_stats} != {s}")
+
     proxy.stop()
     router.shutdown()
     router.server_close()
@@ -214,6 +239,7 @@ def main():
     print(f"TTFB (streaming):      {ttfb*1000:.0f} ms")
     print(f"Stream total:          {total*1000:.0f} ms")
     print(f"6 concurrent streams:  {concurrent*1000:.0f} ms")
+    print(f"Tokens counted:        in={get_token_stats()['input']} out={get_token_stats()['output']}")
     print(f"Router requests seen:  {sum(1 for r in received if r[0]=='router_request')}")
     print()
     for c in [c for c in received if c[0] == "check"]:
