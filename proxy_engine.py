@@ -975,14 +975,21 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         stop_evt = {"type": "content_block_stop", "index": tb["block_index"]}
                         self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(stop_evt)}\n\n".encode("utf-8"))
 
-                    # Message delta
+                    # Message delta. BY8 sums input + cache_creation + cache_read, so
+                    # all three must be present or Claude Code's autocompact counter
+                    # stays at zero and compaction never fires.
                     msg_delta = {
                         "type": "message_delta",
                         "delta": {
                             "stop_reason": "tool_use" if has_tools else "end_turn",
                             "stop_sequence": None
                         },
-                        "usage": {"output_tokens": 50}
+                        "usage": {
+                            "input_tokens": stream_in,
+                            "output_tokens": stream_out,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation_input_tokens": 0
+                        }
                     }
                     self.wfile.write(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode("utf-8"))
 
@@ -1047,6 +1054,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             "input": args
                         })
 
+                # The non-Claude router reports no cache tokens, but Claude Code's
+                # autocompact counter (BY8) sums input + cache_creation + cache_read.
+                # Omitting them zeroes the counter and compaction never fires.
+                router_usage = oresp.get("usage", {})
+                input_tokens = router_usage.get("prompt_tokens", 0) or 0
+                cache_read = router_usage.get("cached_prompt_tokens", 0) or 0
+                cache_creation = router_usage.get("cache_creation_tokens", 0) or 0
+
                 anthropic_resp = {
                     "id": msg_id,
                     "type": "message",
@@ -1055,12 +1070,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     "content": content_blocks,
                     "stop_reason": stop_reason,
                     "usage": {
-                        "input_tokens": oresp.get("usage", {}).get("prompt_tokens", 0),
-                        "output_tokens": oresp.get("usage", {}).get("completion_tokens", 0)
+                        "input_tokens": input_tokens,
+                        "output_tokens": router_usage.get("completion_tokens", 0) or 0,
+                        "cache_read_input_tokens": cache_read,
+                        "cache_creation_input_tokens": cache_creation
                     }
                 }
-                usage = oresp.get("usage", {})
-                add_tokens(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+                add_tokens(input_tokens + cache_read + cache_creation,
+                           router_usage.get("completion_tokens", 0) or 0)
                 payload = json.dumps(anthropic_resp).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

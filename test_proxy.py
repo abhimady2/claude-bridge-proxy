@@ -231,6 +231,54 @@ def main():
         endpoint_stats = json.loads(r.read())
     check("tokens_endpoint", endpoint_stats == s, f"{endpoint_stats} != {s}")
 
+    # --- 10. usage fields Claude Code's autocompact actually counts.
+    # BY8() = input + cache_creation + cache_read. If the proxy omits the two
+    # cache fields the counter reads 0 and compaction never fires -- this is the
+    # bug that made Atria sessions die at the context limit.
+    rq = urllib.request.Request(
+        f"http://127.0.0.1:{PROXY_PORT}/v1/messages",
+        data=json.dumps({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "usage check"}],
+            "stream": False,
+        }).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(rq, timeout=15) as r:
+        usage = json.loads(r.read())["usage"]
+    check("usage_has_input", usage.get("input_tokens") == 7, str(usage))
+    check("usage_has_output", usage.get("output_tokens") == 3, str(usage))
+    check("usage_has_cache_read", "cache_read_input_tokens" in usage, str(usage))
+    check("usage_has_cache_creation", "cache_creation_input_tokens" in usage, str(usage))
+    by8 = (usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+           + usage.get("cache_read_input_tokens", 0) + usage.get("output_tokens", 0))
+    check("by8_counter_nonzero", by8 > 0, f"BY8={by8}")
+
+    # --- 11. streaming message_delta carries the same fields
+    sq = urllib.request.Request(
+        f"http://127.0.0.1:{PROXY_PORT}/v1/messages",
+        data=json.dumps({
+            "model": "claude-sonnet-4",
+            "messages": [{"role": "user", "content": "stream usage"}],
+            "stream": True,
+        }).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    delta_data = None
+    with urllib.request.urlopen(sq, timeout=15) as r:
+        for raw in r:
+            line = raw.decode(errors="replace").strip()
+            if line.startswith("data:") and "message_delta" in line:
+                delta_data = json.loads(line[5:].strip())
+    check("stream_delta_usage", delta_data and "usage" in delta_data, str(delta_data))
+    check("stream_delta_input_tokens",
+          delta_data and delta_data["usage"].get("input_tokens", 0) >= 0, str(delta_data))
+    check("stream_delta_cache_fields",
+          delta_data and "cache_read_input_tokens" in delta_data["usage"]
+          and "cache_creation_input_tokens" in delta_data["usage"], str(delta_data))
+
     proxy.stop()
     router.shutdown()
     router.server_close()
