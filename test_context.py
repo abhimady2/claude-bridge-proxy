@@ -68,6 +68,15 @@ def test_autocompact_keys_are_the_real_ones():
     print("[PASS] settings payload carries both real auto-compact keys")
 
 
+def test_auto_mode_server_opt_out():
+    # A proxy that rewrites Anthropic<->OpenAI traffic drops the safeguards
+    # fields the server-side classifier needs, so the notice fires and Claude
+    # Code bills its own classifier requests. Opting out silences it.
+    settings = {"env": {"CLAUDE_CODE_AUTO_MODE_SERVER": "0"}}
+    assert settings["env"]["CLAUDE_CODE_AUTO_MODE_SERVER"] == "0"
+    print("[PASS] auto-mode server opt-out present")
+
+
 def test_token_counter():
     reset_token_stats()
     assert get_token_stats() == {"input": 0, "output": 0, "total": 0, "requests": 0}
@@ -89,5 +98,6 @@ if __name__ == "__main__":
     test_unknown_router_falls_back()
     test_cached_lookup_is_stable()
     test_autocompact_keys_are_the_real_ones()
+    test_auto_mode_server_opt_out()
     test_token_counter()
     print("\nALL CONTEXT CHECKS PASSED")

@@ -26,7 +26,7 @@ from proxy_engine import (
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # Configuration paths
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ClaudeBridge")
@@ -851,6 +851,11 @@ class ClaudeBridgeApp:
             context_length = cfg["context_length"]
             settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_length)
             settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(context_length)
+            # This proxy rewrites Anthropic<->OpenAI traffic, which strips the
+            # safeguards request/response fields the auto-mode classifier needs,
+            # so Claude Code falls back to its own billed classifier requests.
+            # Asking for server checks here can never succeed.
+            settings["env"]["CLAUDE_CODE_AUTO_MODE_SERVER"] = "0"
             settings["env"].pop("DISABLE_COMPACT", None)
             if cfg.get("auto_compact_window", True):
                 settings["autoCompactWindow"] = context_length
@@ -901,6 +906,7 @@ class ClaudeBridgeApp:
                             "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                             "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                            "CLAUDE_CODE_AUTO_MODE_SERVER",
                         ):
                             settings["env"].pop(k, None)
                     settings.pop("autoCompactWindow", None)
