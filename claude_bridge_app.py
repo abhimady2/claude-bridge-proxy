@@ -26,7 +26,7 @@ from proxy_engine import (
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.4"
 
 # Configuration paths
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ClaudeBridge")
@@ -68,7 +68,8 @@ def get_default_providers():
             "model": "Atria-Dawn-Preview",
             "sonnet_model": "Atria-Dawn-Preview",
             "opus_model": "Atria-Dawn-Preview",
-            "haiku_model": "Atria-Dawn-Preview"
+            "haiku_model": "Atria-Dawn-Preview",
+            "context_length": 128000
         },
         "Agent Router": {
             "router_url": "https://agentrouter.org",
@@ -527,6 +528,27 @@ class ClaudeBridgeApp:
         self.log(f"Claude Bridge v{APP_VERSION} initialized. Ready to start.")
 
         # ponytail: 2s poll of a module-level dict. No per-request work and no
+        claude_frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(claude_frame, text="Claude Code Setup:", style="FieldLabel.TLabel").pack(side="left", padx=(0, 8))
+
+        sync_btn = tk.Button(
+            claude_frame, text="⚡ Configure Claude Code Settings", command=self.configure_claude_settings,
+            font=("Segoe UI", 8, "bold"), bg="#3b82f6", fg="#ffffff", activebackground="#2563eb", activeforeground="#ffffff",
+            relief="flat", padx=8, pady=3, cursor="hand2"
+        )
+        sync_btn.pack(side="left", padx=3)
+
+        restore_btn = tk.Button(
+            claude_frame, text="🔄 Restore Original", command=self.restore_claude_settings,
+            font=("Segoe UI", 8), bg="#52525b", fg="#ffffff", activebackground="#71717a", activeforeground="#ffffff",
+            relief="flat", padx=8, pady=3, cursor="hand2"
+        )
+        restore_btn.pack(side="left", padx=3)
+
+        # Options Row
+
+        # ponytail: 2s poll of a module-level dict. No per-request work and no
         # second event loop; the cost is one label update per tick.
         self._refresh_token_display()
         self.root.after(2000, self._poll_tokens)
@@ -535,27 +557,6 @@ class ClaudeBridgeApp:
         if self.cfg.get("auto_start", True):
             self.root.after(300, self.start_proxy)
 
-    def _refresh_token_display(self):
-        s = get_token_stats()
-        self.token_display.configure(
-            text=f"↑ {s['input']:,} · ↓ {s['output']:,} · Σ {s['total']:,} · {s['requests']} reqs"
-        )
-
-    def _poll_tokens(self):
-        """Background token counter refresh. Re-arms itself until the window dies."""
-        try:
-            self._refresh_token_display()
-        except Exception:
-            return
-        self.root.after(2000, self._poll_tokens)
-
-    def reset_token_counter(self):
-        reset_token_stats()
-        self._refresh_token_display()
-        self.log("Token counter reset to zero.")
-
-    def _on_provider_selected(self, event=None):
-        p_name = self.provider_var.get()
         p_data = self.cfg.get("providers", {}).get(p_name, {})
         if not p_data:
             return
@@ -811,81 +812,6 @@ class ClaudeBridgeApp:
         self.start_btn.configure(text="▶  START PROXY", bg="#10b981", activebackground="#059669")
         self.log("Proxy stopped.")
         self._update_tray_menu(is_running=False)
-
-    def configure_claude_settings(self):
-        r"""Points C:\Users\abhis\.claude\settings.json to the local proxy."""
-        cfg = self.get_current_config()
-        port = cfg["port"]
-        local_base_url = f"http://127.0.0.1:{port}"
-
-        try:
-            os.makedirs(CLAUDE_DIR, exist_ok=True)
-            settings = {}
-            if os.path.exists(CLAUDE_SETTINGS_PATH):
-                # Make backup if not already present
-                if not os.path.exists(CLAUDE_BACKUP_PATH):
-                    shutil.copy2(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
-                    self.log(f"Created Claude settings backup at {CLAUDE_BACKUP_PATH}")
-                try:
-                    with open(CLAUDE_SETTINGS_PATH, "r", encoding="utf-8") as f:
-                        settings = json.load(f)
-                except Exception:
-                    settings = {}
-
-            if "env" not in settings:
-                settings["env"] = {}
-
-            settings["env"]["ANTHROPIC_BASE_URL"] = local_base_url
-            settings["env"]["CLAUDE_CODE_USE_AUTH_TOKEN"] = "true"
-            settings["env"]["ANTHROPIC_AUTH_TOKEN"] = "claude-bridge-local-token"
-            settings["env"]["ANTHROPIC_MODEL"] = cfg["model"]
-            settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] = cfg["opus_model"]
-            settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = cfg["sonnet_model"]
-            settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = cfg["haiku_model"]
-
-            # Auto-compact: CLAUDE_CODE_MAX_CONTEXT_TOKENS is only honored when
-            # DISABLE_COMPACT is set, and it only raises the *ceiling* — Claude Code
-            # still won't trigger compaction on its own. The two keys that actually
-            # make it compact at this limit are autoCompactWindow (threshold) and
-            # CLAUDE_CODE_AUTO_COMPACT_WINDOW (same value as env override).
-            context_length = cfg["context_length"]
-            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_length)
-            settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(context_length)
-            # This proxy rewrites Anthropic<->OpenAI traffic, which strips the
-            # safeguards request/response fields the auto-mode classifier needs,
-            # so Claude Code falls back to its own billed classifier requests.
-            # Asking for server checks here can never succeed.
-            settings["env"]["CLAUDE_CODE_AUTO_MODE_SERVER"] = "0"
-            settings["env"].pop("DISABLE_COMPACT", None)
-            if cfg.get("auto_compact_window", True):
-                settings["autoCompactWindow"] = context_length
-            else:
-                settings.pop("autoCompactWindow", None)
-
-            with open(CLAUDE_SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump(settings, f, indent=2)
-
-            self.log(f"Updated Claude Code settings for provider [{self.provider_var.get()}].")
-            compact_note = (
-                f"Auto-compact at {context_length:,} tokens (matches this model's context window)."
-                if cfg.get("auto_compact_window", True) else
-                "Auto-compact disabled — Claude Code will use its own defaults."
-            )
-            messagebox.showinfo(
-                "Claude Code Configured",
-                f"Claude Code settings updated successfully!\n\n"
-                f"Active Provider: {self.provider_var.get()}\n"
-                f"Base URL: {local_base_url}\n"
-                f"Sonnet: {cfg['sonnet_model']}\n"
-                f"Opus: {cfg['opus_model']}\n"
-                f"Haiku: {cfg['haiku_model']}\n"
-                f"Custom: {cfg['model']}\n\n"
-                f"{compact_note}\n\n"
-                f"Claude Code is now connected through Claude Bridge!"
-            )
-        except Exception as e:
-            self.log(f"Failed to configure Claude Code settings: {e}")
-            messagebox.showerror("Error", f"Could not update Claude Code settings:\n{e}")
 
     def restore_claude_settings(self):
         """Restores original settings.json from backup."""

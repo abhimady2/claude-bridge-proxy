@@ -14,6 +14,7 @@ from proxy_engine import (
     DEFAULT_CONTEXT_LENGTH,
     fetch_context_length,
     _lookup_known_context,
+    trim_openai_messages,
     add_tokens,
     get_token_stats,
     reset_token_stats,
@@ -21,19 +22,19 @@ from proxy_engine import (
 
 
 def test_known_lookup():
-    assert _lookup_known_context("Atria-Dawn-Preview") == 256000
-    assert _lookup_known_context("atria-dawn-preview") == 256000
+    assert _lookup_known_context("Atria-Dawn-Preview") == 128000
+    assert _lookup_known_context("atria-dawn-preview") == 128000
     assert _lookup_known_context("claude-sonnet-4") == 200000
     assert _lookup_known_context("deepseek-ai/DeepSeek-V4-Flash-0731") is None
     assert _lookup_known_context("") is None
     print("[PASS] known-table lookup incl. case-insensitivity")
 
 
-def test_known_table_matches_default_for_atria():
-    # Atria's real window is 256k, which is also the default. The two agreeing
-    # is what makes the safe fallback safe.
-    assert _lookup_known_context("Atria-Dawn-Preview") == DEFAULT_CONTEXT_LENGTH == 256000
-    print("[PASS] Atria context == default (256000)")
+def test_atria_context_limit():
+    # Atria-Dawn-Preview TokenPlan ingress gateway rejects payloads > 875KB (~135k tokens).
+    # The known table resolves Atria to 128,000 so Claude Code compacts at ~83k tokens.
+    assert _lookup_known_context("Atria-Dawn-Preview") == 128000
+    print("[PASS] Atria context limit == 128000 (safe for TokenPlan gateway)")
 
 
 def test_unknown_router_falls_back():
@@ -92,12 +93,39 @@ def test_token_counter():
     print("[PASS] token counter accumulates, tolerates junk, resets cleanly")
 
 
+def test_trim_openai_messages():
+    # Oversized payload gets compacted while preserving system prompt and tool pairs
+    msgs = [
+        {"role": "system", "content": "system instruction"},
+        {"role": "user", "content": "old question " * 500},
+        {"role": "assistant", "content": "old answer " * 500},
+        {"role": "user", "content": "tool call step"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "tc1", "content": "tool result"},
+        {"role": "assistant", "content": "tool done"},
+        {"role": "user", "content": "latest user prompt"}
+    ]
+    trimmed = trim_openai_messages(msgs, max_bytes=3000)
+    assert len(json.dumps(trimmed).encode("utf-8")) <= 3000
+    assert trimmed[0]["role"] == "system"
+    # Notice marker present
+    assert any("compacted by Claude Bridge" in str(m.get("content")) for m in trimmed)
+    # Latest user prompt preserved
+    assert trimmed[-1]["content"] == "latest user prompt"
+    # Tool call pairing preserved
+    roles = [m["role"] for m in trimmed]
+    if "tool" in roles:
+        assert "assistant" in roles
+    print("[PASS] trim_openai_messages compacts payload and preserves integrity")
+
+
 if __name__ == "__main__":
     test_known_lookup()
-    test_known_table_matches_default_for_atria()
+    test_atria_context_limit()
     test_unknown_router_falls_back()
     test_cached_lookup_is_stable()
     test_autocompact_keys_are_the_real_ones()
     test_auto_mode_server_opt_out()
     test_token_counter()
+    test_trim_openai_messages()
     print("\nALL CONTEXT CHECKS PASSED")

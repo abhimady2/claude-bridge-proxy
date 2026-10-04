@@ -9,7 +9,7 @@ import time
 import urllib.request
 import http.server
 
-from proxy_engine import ProxyServer, get_token_stats, reset_token_stats
+from proxy_engine import ProxyServer, get_token_stats, reset_token_stats, heal_anthropic_messages, convert_anthropic_to_openai
 
 PROXY_PORT = 4199
 ROUTER_PORT = 4198
@@ -278,6 +278,27 @@ def main():
     check("stream_delta_cache_fields",
           delta_data and "cache_read_input_tokens" in delta_data["usage"]
           and "cache_creation_input_tokens" in delta_data["usage"], str(delta_data))
+
+    # --- 11. heal_anthropic_messages preserves thinking and adds placeholder to assistant tool calls
+    raw_tool_msg = [{"role": "assistant", "content": [{"type": "tool_use", "id": "t1"}]}]
+    healed_tool_msg = heal_anthropic_messages(raw_tool_msg)
+    check("heal_tool_use_injects_thinking",
+          len(healed_tool_msg[0]["content"]) == 2 and healed_tool_msg[0]["content"][0]["type"] == "thinking")
+
+    raw_think_msg = [{"role": "assistant", "content": [{"type": "thinking", "thinking": "abc"}, {"type": "tool_use", "id": "t1"}]}]
+    healed_think_msg = heal_anthropic_messages(raw_think_msg)
+    check("heal_tool_use_preserves_existing_thinking",
+          len(healed_think_msg[0]["content"]) == 2 and healed_think_msg[0]["content"][0]["thinking"] == "abc")
+
+    # --- 12. max_tokens clamping for routers with <= 65536 output token ceilings (like Atria)
+    clamped_large = convert_anthropic_to_openai({"messages": [], "max_tokens": 128000}, "test-model")
+    check("clamp_large_max_tokens_to_65536", clamped_large.get("max_tokens") == 65536)
+
+    clamped_context = convert_anthropic_to_openai({"messages": [], "max_tokens": 256000}, "test-model")
+    check("clamp_context_sized_max_tokens_to_65536", clamped_context.get("max_tokens") == 65536)
+
+    normal_max = convert_anthropic_to_openai({"messages": [], "max_tokens": 4096}, "test-model")
+    check("preserve_normal_max_tokens", normal_max.get("max_tokens") == 4096)
 
     proxy.stop()
     router.shutdown()
