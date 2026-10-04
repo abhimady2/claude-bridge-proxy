@@ -5,8 +5,8 @@ a = Analysis(
     ['claude_bridge_app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=['pystray._win32', 'anthropic'],
+    datas=[('assets', 'assets')],
+    hiddenimports=['pystray._win32', 'anthropic', 'PIL.ImageTk'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/icon.ico',
 )

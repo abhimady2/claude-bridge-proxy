@@ -27,6 +27,7 @@ ENV/
 .vscode/
 .idea/
 
-# Local test files
-test_new_features.py
+# Local test files & scratch
+test_*.py
 check_keys.py
+scratch/

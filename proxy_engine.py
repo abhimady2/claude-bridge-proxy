@@ -75,7 +75,83 @@ def select_api_key(router_url, api_keys_list, multi_key_enabled=True):
         return key
 
 
+def next_untried_key(router_url, api_keys_list, tried):
+    """Next key in round-robin order that hasn't been attempted yet for this request.
+
+    Used during 429/402 failover: walks the whole pool (not just one alternate)
+    and advances the shared counter so the pool keeps rotating after a limit hit.
+    Returns None once every key has been tried, so the caller can hand off to the
+    other router instead of erroring.
+    """
+    if not api_keys_list:
+        return None
+    with _key_lock:
+        start = _key_round_robin.get(router_url, 0)
+        for i in range(len(api_keys_list)):
+            key = api_keys_list[(start + i) % len(api_keys_list)]
+            if key not in tried:
+                _key_round_robin[router_url] = start + i + 1
+                return key
+    return None
+
+
 # --- Image to Local Disk Bridge (Vision for Atria & TokenPlan limit fix) -------
+
+# Routers that 400-rejected an inline image_url part get remembered here and
+# every later request to them strips images to file paths up front, instead of
+# paying a failed round-trip each time. Process-lifetime only; a restart resets
+# it, which is also the escape hatch if a router fixes itself.
+_inline_image_rejects = set()
+_inline_image_lock = threading.Lock()
+
+
+def router_rejects_inline_images(router_url):
+    with _inline_image_lock:
+        return router_url in _inline_image_rejects
+
+
+def mark_router_rejects_inline_images(router_url):
+    with _inline_image_lock:
+        _inline_image_rejects.add(router_url)
+
+
+def strip_inline_images(openai_req):
+    """Replace every inline image_url part in an OpenAI request with a text
+    note carrying the file path that save_base64_image already wrote."""
+    for msg in openai_req.get("messages", []):
+        c = msg.get("content")
+        if not isinstance(c, list):
+            continue
+        kept = []
+        for part in c:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url = (part.get("image_url") or {}).get("url", "")
+                media = "image"
+                if url.startswith("data:"):
+                    media = url[5:].split(";", 1)[0] or media
+                kept.append({
+                    "type": "text",
+                    "text": (f"[Image ({media}) omitted: this router does not accept "
+                             f"inline image data. Ask the user to describe it or use a "
+                             f"local image tool if available.]")
+                })
+            else:
+                kept.append(part)
+        msg["content"] = kept
+    return openai_req
+
+# Media types OpenAI-compatible vision endpoints accept inline. Anything else
+# (svg, bmp, ...) is passed as a disk path rather than risking a 400.
+VISION_MEDIA_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
+
+
+def clean_base64(data):
+    """Strips a data URL prefix (data:image/png;base64,...) if one is present."""
+    if data and "," in data and "base64" in data[:50]:
+        return data.split(",", 1)[1]
+    return data
+
+
 def save_base64_image(media_type, base64_data, save_dir=None):
     """
     Decodes a base64 image and saves it to a persistent local temp folder.
@@ -84,11 +160,9 @@ def save_base64_image(media_type, base64_data, save_dir=None):
     try:
         if not base64_data:
             return None
-        
-        # Strip data URL prefix if present (e.g. data:image/png;base64,...)
-        if "," in base64_data and "base64" in base64_data[:50]:
-            base64_data = base64_data.split(",", 1)[1]
-            
+
+        base64_data = clean_base64(base64_data)
+
         ext_map = {
             "image/jpeg": ".jpg",
             "image/jpg": ".jpg",
@@ -129,14 +203,17 @@ def save_base64_image(media_type, base64_data, save_dir=None):
         return None
 
 
-def process_anthropic_images(messages, auto_save=True):
+def process_anthropic_images(messages, auto_save=True, strip_images=False):
     """
     Scans Anthropic messages for image blocks.
-    If auto_save is True, saves images to disk and converts the image blocks
-    into text blocks containing the file path for models that don't support vision
-    or have gateway size limits (like Atria).
+
+    auto_save=True writes a copy of each image to disk so agent tools and scripts
+    can still reach the file. strip_images=True replaces the image block with that
+    path, for routers whose gateway rejects inline image data or enforces a tight
+    request body ceiling (e.g. Atria TokenPlan). Otherwise the image passes
+    through untouched to the vision-capable target.
     """
-    if not auto_save or not messages:
+    if (not auto_save and not strip_images) or not messages:
         return messages
     processed = []
     for msg in messages:
@@ -148,13 +225,17 @@ def process_anthropic_images(messages, auto_save=True):
             new_content = []
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "image":
-                    src = b.get("source", {})
+                    src = b.get("source") or {}
                     if src.get("type") == "base64" and src.get("data"):
-                        saved_path = save_base64_image(src.get("media_type", "image/png"), src.get("data"))
-                        if saved_path:
+                        saved_path = save_base64_image(src.get("media_type", "image/png"), src.get("data")) if auto_save else None
+                        if strip_images and saved_path:
                             new_content.append({
                                 "type": "text",
-                                "text": f"[User attached image saved at: {saved_path}. Inspect or read this image from this local file path.]"
+                                "text": (f"[An image was attached but this model/router cannot receive "
+                                         f"image data, so it has been omitted. Do NOT try to Read or "
+                                         f"open {saved_path} -- the result would be stripped the same "
+                                         f"way. Tell the user you cannot view the image and ask them "
+                                         f"to describe it in words.]")
                             })
                             continue
                 elif isinstance(b, dict) and b.get("type") == "tool_result":
@@ -163,20 +244,22 @@ def process_anthropic_images(messages, auto_save=True):
                         new_tr_c = []
                         for sub_b in tr_c:
                             if isinstance(sub_b, dict) and sub_b.get("type") == "image":
-                                src = sub_b.get("source", {})
+                                src = sub_b.get("source") or {}
                                 if src.get("type") == "base64" and src.get("data"):
-                                    p = save_base64_image(src.get("media_type", "image/png"), src.get("data"))
-                                    if p:
+                                    p = save_base64_image(src.get("media_type", "image/png"), src.get("data")) if auto_save else None
+                                    if strip_images and p:
                                         new_tr_c.append({
                                             "type": "text",
-                                            "text": f"[Tool returned image saved at: {p}]"
+                                            "text": (f"[A tool returned an image, but this model/router "
+                                                     f"cannot receive image data so it was omitted. Do NOT "
+                                                     f"Read {p} to retry -- it would be stripped again. "
+                                                     f"Continue without the image or ask the user to "
+                                                     f"describe it.]")
                                         })
                                         continue
                             new_tr_c.append(sub_b)
                         b_copy = dict(b)
                         b_copy["content"] = new_tr_c
-                        new_content.append(b_copy)
-                        continue
                         new_content.append(b_copy)
                         continue
                 new_content.append(b)
@@ -210,6 +293,13 @@ def _close_client():
             _client.close()
             _client = None
 
+
+# Upstream SSE streams can stall mid-response with no bytes (dead router, dropped
+# TCP, overloaded inference). httpx would then block for the full 600s read timeout
+# and Claude Code would sit waiting for a terminal event until manually nudged.
+# This bounds the *idle* gap between chunks; a healthy long generation keeps
+# sending chunks and is unaffected.
+STREAM_IDLE_TIMEOUT = 240.0
 
 # --- Token accounting ---------------------------------------------------------
 # ponytail: module-level counters read by the UI. ProxyRequestHandler instances
@@ -356,11 +446,20 @@ def heal_anthropic_messages(messages, force_all=False):
     return healed
 
 
-def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=True):
+def openai_message_content(text_parts, image_parts):
+    """OpenAI content is a plain string, or a parts list once images are attached."""
+    text = "\n".join(p for p in text_parts if p)
+    if not image_parts:
+        return text
+    return ([{"type": "text", "text": text}] if text else []) + image_parts
+
+
+def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=True, strip_images=False):
     """
     Translates Anthropic Messages API request format to OpenAI Chat Completions format.
-    Automatically saves attached Anthropic images to disk and provides the local file path
-    for models with TokenPlan/request size limits (such as Atria) or models lacking vision endpoints.
+    Images are forwarded as inline image_url parts when the target accepts them; the
+    disk copy is kept either way. strip_images=True restores the path-only behavior
+    for routers with TokenPlan/request size limits (such as Atria) or no vision endpoint.
     """
     messages = []
     
@@ -383,6 +482,7 @@ def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=T
             messages.append({"role": role, "content": content})
         elif isinstance(content, list):
             text_parts = []
+            image_parts = []
             tool_calls = []
             tool_results = []
             reasoning_parts = []
@@ -396,16 +496,28 @@ def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=T
                 elif btype == "thinking":
                     reasoning_parts.append(block.get("thinking", ""))
                 elif btype == "image":
-                    if auto_save_images:
-                        src = block.get("source", {})
-                        if src.get("type") == "base64" and src.get("data"):
-                            media_type = src.get("media_type", "image/png")
-                            saved_path = save_base64_image(media_type, src.get("data"))
-                            if saved_path:
-                                text_parts.append(
-                                    f"[User attached image file: {saved_path}. "
-                                    f"Note: This is an image file on disk. You are a text-only model and cannot view image pixels directly with the Read tool. If asked about the image, inform the user or inspect its metadata via python script.]"
-                                )
+                    src = block.get("source") or {}
+                    data = src.get("data")
+                    media_type = (src.get("media_type") or "image/png").lower().strip()
+                    if src.get("type") == "base64" and data:
+                        saved_path = save_base64_image(media_type, data) if auto_save_images else None
+                        if not strip_images and media_type in VISION_MEDIA_TYPES:
+                            image_parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{media_type};base64,{clean_base64(data)}"}
+                            })
+                        elif saved_path:
+                            # Must NOT invite the model to read the file back:
+                            # this router cannot receive images, so a Read would
+                            # return an image block that gets stripped into this
+                            # same note again -- an endless read loop.
+                            text_parts.append(
+                                f"[An image was attached but this model/router cannot receive "
+                                f"image data, so it has been omitted from the request. "
+                                f"Do NOT try to Read or open {saved_path} -- the result would be "
+                                f"stripped the same way. Tell the user you cannot view the image "
+                                f"and ask them to describe it in words.]"
+                            )
                 elif btype == "tool_use":
                     tool_calls.append({
                         "id": block.get("id", f"call_{uuid.uuid4().hex[:8]}"),
@@ -425,11 +537,22 @@ def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=T
                                     parts.append(sub_b.get("text", ""))
                                 elif sub_b.get("type") == "image":
                                     if auto_save_images:
-                                        src = sub_b.get("source", {})
+                                        src = sub_b.get("source") or {}
                                         if src.get("type") == "base64" and src.get("data"):
                                             p = save_base64_image(src.get("media_type", "image/png"), src.get("data"))
                                             if p:
-                                                parts.append(f"[Image file content: {p}]")
+                                                # OpenAI `tool` messages carry text only, so a
+                                                # tool-returned image can only be passed as a path.
+                                                # Must NOT say "read this file": a Read returns an
+                                                # image block that lands right back here, so the
+                                                # model would read its own output forever.
+                                                parts.append(
+                                                    f"[A tool returned an image ({p}). OpenAI tool "
+                                                    f"messages cannot carry image data, so it is not "
+                                                    f"included here. Do NOT Read {p} to retry -- that "
+                                                    f"returns another image and repeats this. Continue "
+                                                    f"without the image, or ask the user to describe it.]"
+                                                )
                         res_content = "\n".join(parts)
                     tool_results.append({
                         "role": "tool",
@@ -466,8 +589,8 @@ def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=T
             else:
                 for tr in tool_results:
                     messages.append(tr)
-                if text_parts:
-                    messages.append({"role": role, "content": "\n".join(text_parts)})
+                if text_parts or image_parts:
+                    messages.append({"role": role, "content": openai_message_content(text_parts, image_parts)})
                 elif not tool_results:
                     messages.append({"role": role, "content": ""})
 
@@ -586,6 +709,20 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if self.log_callback:
             self.log_callback(text)
 
+    def _close_sse_stream(self, reason=""):
+        """Best-effort terminal SSE event for a stream that already sent its 200
+        headers and then died mid-response. Without this Claude Code keeps the
+        turn open waiting for message_stop, which is the "chat goes dead until
+        nudged" symptom.
+        """
+        if reason:
+            self.emit_log(reason)
+        try:
+            self.wfile.write(b'event: message_stop\ndata: {"type": "message_stop"}\n\n')
+            self.wfile.flush()
+        except Exception:
+            pass
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -651,7 +788,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _handle_anthropic_native(self, anthropic_req, target_model, router_url, api_key, cfg,
-                                allow_fallback=False, fallback_cfg=None, fallback_name=""):
+                                allow_fallback=False, fallback_cfg=None, fallback_name="", tb=None):
         """
         Directly routes requests to Anthropic-compatible providers (like AgentRouter)
         using the official anthropic SDK client, which complies with Aliyun WAF TLS
@@ -667,6 +804,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         api_keys = parse_api_keys(api_key)
         multi_key_enabled = cfg.get("multi_key_rotation", True)
         current_key = select_api_key(router_url, api_keys, multi_key_enabled)
+        tried_keys = set()  # keys already attempted for this request (429 failover)
         client = _get_anthropic_client(current_key, base_url)
         is_stream = anthropic_req.get("stream", True)
         thinking_mode = cfg.get("thinking_mode", "thinking_block")
@@ -676,7 +814,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             max_toks = max(1, min(int(max_toks), 65536))
 
         auto_save_images = cfg.get("auto_save_images", True)
-        processed_msgs = process_anthropic_images(anthropic_req.get("messages", []), auto_save=auto_save_images)
+        processed_msgs = process_anthropic_images(anthropic_req.get("messages", []),
+                                                  auto_save=auto_save_images,
+                                                  strip_images=cfg.get("strip_images", False))
 
         clean_req = {
             "model": target_model,
@@ -695,20 +835,23 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             try:
                 with client.messages.with_streaming_response.create(**req_dict, stream=True) as resp:
                     # 1. Multi-key failover retry on 429/402
-                    if resp.status_code in (429, 402) and multi_key_enabled and len(api_keys) > 1:
-                        for alt_key in [k for k in api_keys if k != current_key]:
+                    if resp.status_code in (429, 402) and multi_key_enabled:
+                        tried_keys.add(current_key)
+                        alt_key = next_untried_key(router_url, api_keys, tried_keys)
+                        if alt_key:
                             old_m = f"...{current_key[-4:]}" if len(current_key) >= 4 else "key"
                             new_m = f"...{alt_key[-4:]}" if len(alt_key) >= 4 else "key"
                             self.emit_log(f"Key {old_m} hit limit ({resp.status_code}). Rotating to {new_m}...")
                             current_key = alt_key
                             client = _get_anthropic_client(alt_key, base_url)
+                            tried_keys.add(alt_key)
                             return _execute_streaming(req_dict)
 
                     if resp.status_code != 200:
                         err_body = resp.read().decode("utf-8", errors="replace")
                         if allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
                             self.emit_log(f"Anthropic Router Error ({resp.status_code}): Failing over to fallback router [{fallback_name}]...")
-                            return self._execute_request(anthropic_req, fallback_cfg, allow_fallback=False)
+                            return self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
                         self.emit_log(f"Router Error ({resp.status_code}): {err_body}")
                         self.send_response(resp.status_code)
                         self.send_header("Content-Type", "application/json")
@@ -807,13 +950,16 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     return _execute_streaming(new_req)
 
                 # Fallback on 429/402 to next key in pool
-                if status in (429, 402) and multi_key_enabled and len(api_keys) > 1:
-                    for alt_key in [k for k in api_keys if k != current_key]:
+                if status in (429, 402) and multi_key_enabled:
+                    tried_keys.add(current_key)
+                    alt_key = next_untried_key(router_url, api_keys, tried_keys)
+                    if alt_key:
                         old_m = f"...{current_key[-4:]}" if len(current_key) >= 4 else "key"
                         new_m = f"...{alt_key[-4:]}" if len(alt_key) >= 4 else "key"
                         self.emit_log(f"Key {old_m} hit limit ({status}). Failing over to next key {new_m}...")
                         current_key = alt_key
                         client = _get_anthropic_client(alt_key, base_url)
+                        tried_keys.add(alt_key)
                         return _execute_streaming(req_dict)
 
                 # Fallback to default_model if target_model failed due to quota (402) or unavailable (404/503)
@@ -824,9 +970,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     return _execute_streaming(new_req)
 
                 # Failover to secondary router if available
-                if status in (500, 502, 503, 504) and allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
+                if status in (429, 500, 502, 503, 504, 520, 521, 522, 523, 524) and allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
                     self.emit_log(f"Anthropic Router Error ({status}): Failing over to fallback router [{fallback_name}]...")
-                    return self._execute_request(anthropic_req, fallback_cfg, allow_fallback=False)
+                    return self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
 
                 self.emit_log(f"Router Error ({status}): {err_body}")
                 try:
@@ -892,13 +1038,16 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     return _execute_non_streaming(new_req)
 
                 # Fallback on 429/402 to next key in pool
-                if status in (429, 402) and multi_key_enabled and len(api_keys) > 1:
-                    for alt_key in [k for k in api_keys if k != current_key]:
+                if status in (429, 402) and multi_key_enabled:
+                    tried_keys.add(current_key)
+                    alt_key = next_untried_key(router_url, api_keys, tried_keys)
+                    if alt_key:
                         old_m = f"...{current_key[-4:]}" if len(current_key) >= 4 else "key"
                         new_m = f"...{alt_key[-4:]}" if len(alt_key) >= 4 else "key"
                         self.emit_log(f"Key {old_m} hit limit ({status}). Failing over to next key {new_m}...")
                         current_key = alt_key
                         client = _get_anthropic_client(alt_key, base_url)
+                        tried_keys.add(alt_key)
                         return _execute_non_streaming(req_dict)
 
                 # Fallback to default_model if target_model failed due to quota (402) or unavailable (404/503)
@@ -909,9 +1058,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     return _execute_non_streaming(new_req)
 
                 # Failover to secondary router if available
-                if status in (500, 502, 503, 504) and allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
+                if status in (429, 500, 502, 503, 504, 520, 521, 522, 523, 524) and allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
                     self.emit_log(f"Anthropic Router Error ({status}): Failing over to fallback router [{fallback_name}]...")
-                    return self._execute_request(anthropic_req, fallback_cfg, allow_fallback=False)
+                    return self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
 
                 self.emit_log(f"Router Error ({status}): {err_body}")
                 self.send_response(status)
@@ -936,61 +1085,30 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         else:
             _execute_non_streaming(clean_req)
 
-    def do_POST(self):
-        # Claude Code sends Expect: 100-continue on large bodies. Answer it or
-        # the client stalls waiting for the go-ahead before sending its payload.
-        if self.headers.get("Expect", "").lower() == "100-continue":
-            self.send_response_only(100)
-            self.end_headers()
-            try:
-                self.wfile.flush()
-            except Exception:
-                pass
 
-        if self.path.startswith("/v1/messages/count_tokens"):
-            # Estimate tokens roughly
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
-            tokens = max(1, len(body) // 4)
-            payload = json.dumps({"input_tokens": tokens}).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-            return
+    def _route_request(self, anthropic_req, cfg):
+        """Resolve active + fallback provider configs for this request.
 
-        if not self.path.startswith("/v1/messages"):
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
+        cfg carries the flat fields the GUI always writes (router_url, api_key,
+        models) plus the hybrid options (enable_hybrid_router, all_providers,
+        hybrid_primary_provider, hybrid_secondary_provider, hybrid_fallback).
 
-        # Handle /v1/messages
-        content_length = int(self.headers.get("Content-Length", 0))
-        raw_body = self.rfile.read(content_length)
+        Fast/haiku and vision tasks go to the secondary (fast) router; heavy
+        sonnet/opus tasks go to the primary. Returns (active_cfg, fallback_cfg,
+        fallback_name, allow_fallback).
+        """
+        router_url = (cfg.get("router_url") or "").lower()
+        all_providers = cfg.get("all_providers", {}) or {}
+        primary_name = cfg.get("hybrid_primary_provider") or cfg.get("primary_provider") or ""
+        secondary_name = cfg.get("hybrid_secondary_provider") or cfg.get("secondary_provider") or ""
+        is_hybrid = bool(cfg.get("enable_hybrid_router") or cfg.get("is_hybrid")) and primary_name and secondary_name
 
-        try:
-            anthropic_req = json.loads(raw_body.decode("utf-8"))
-        except Exception as e:
-            payload = json.dumps({"error": str(e)}).encode("utf-8")
-            self.send_response(400)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            return
-
-        cfg = self.config_getter() if self.config_getter else {}
-        is_hybrid = cfg.get("enable_hybrid_router", False) or cfg.get("is_hybrid", False)
-        all_providers = cfg.get("all_providers", {})
         req_model = (anthropic_req.get("model") or "").lower()
         is_haiku = "haiku" in req_model
 
-        # Detect if request contains images (vision task)
+        # Detect images in the request body (vision task).
         has_images = False
-        for m in anthropic_req.get("messages", []):
+        for m in anthropic_req.get("messages") or []:
             c = m.get("content")
             if isinstance(c, list):
                 for b in c:
@@ -1006,40 +1124,68 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             if has_images:
                 break
 
-        fallback_cfg = None
-        fallback_name = ""
-        allow_fallback = False
+        if not is_hybrid:
+            return dict(cfg), None, "", False
 
-        if is_hybrid:
-            primary_name = cfg.get("hybrid_primary_provider") or cfg.get("primary_provider") or "Atria ASI"
-            secondary_name = cfg.get("hybrid_secondary_provider") or cfg.get("secondary_provider") or "Agent Router"
-            primary_cfg = dict(all_providers.get(primary_name, cfg))
-            secondary_cfg = dict(all_providers.get(secondary_name, {}))
+        primary_cfg = dict(all_providers.get(primary_name) or {})
+        secondary_cfg = dict(all_providers.get(secondary_name) or {})
+        # If a named provider is missing, fall back to the flat fields.
+        if not primary_cfg.get("router_url"):
+            primary_cfg = dict(cfg)
+        for k in ("thinking_mode", "auto_save_images", "strip_images", "multi_key_rotation"):
+            if k in cfg:
+                primary_cfg[k] = cfg[k]
+                secondary_cfg[k] = cfg[k]
 
-            for k in ("thinking_mode", "auto_save_images", "multi_key_rotation"):
-                if k in cfg:
-                    primary_cfg[k] = cfg[k]
-                    secondary_cfg[k] = cfg[k]
+        allow_fallback = bool(cfg.get("hybrid_fallback", True))
+        if not secondary_cfg.get("router_url"):
+            return primary_cfg, None, "", allow_fallback
 
-            allow_fallback = cfg.get("hybrid_fallback", True)
-            if has_images and secondary_cfg.get("router_url"):
-                active_cfg = secondary_cfg
-                fallback_cfg = primary_cfg
-                fallback_name = primary_name
-                self.emit_log(f"Hybrid Route: Vision Task (Image attached) -> [{secondary_name}] (vision-capable)")
-            elif is_haiku and secondary_cfg.get("router_url"):
-                active_cfg = secondary_cfg
-                fallback_cfg = primary_cfg
-                fallback_name = primary_name
-                self.emit_log(f"Hybrid Route: Fast Task (Haiku) -> [{secondary_name}]")
-            else:
-                active_cfg = primary_cfg
-                fallback_cfg = secondary_cfg
-                fallback_name = secondary_name
-                self.emit_log(f"Hybrid Route: Heavy Task (Sonnet/Opus) -> [{primary_name}]")
-        else:
-            active_cfg = cfg
+        if has_images or is_haiku:
+            self.emit_log(
+                f"Hybrid Route: {'Vision Task (Image attached)' if has_images else 'Fast Task (Haiku)'} -> [{secondary_name}]"
+            )
+            return secondary_cfg, primary_cfg, primary_name, allow_fallback
+        self.emit_log(f"Hybrid Route: Heavy Task (Sonnet/Opus) -> [{primary_name}]")
+        return primary_cfg, secondary_cfg, secondary_name, allow_fallback
 
+    def _failover_request(self, anthropic_req, fallback_cfg, tb=None, fallback_name=""):
+        """Re-dispatch a request to the fallback router after an upstream error.
+
+        Recursion guard via tb.get('used_fallback'): the fallback router never
+        fails over again, so a broken router cannot cause a loop.
+        """
+        fb_name = fallback_name or fallback_cfg.get("_name") or "fallback"
+        self.emit_log(f"Failing over to fallback router [{fb_name}]...")
+        try:
+            return self._handle_messages(anthropic_req, fallback_cfg, tb={
+                **(tb or {}), "used_fallback": True, "fallback_to": fb_name
+            })
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            err_body = json.dumps({"error": "fallback router failed"}).encode("utf-8")
+            try:
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(err_body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(err_body)
+            except Exception:
+                pass
+
+    def _handle_messages(self, anthropic_req, cfg, tb=None):
+        """Full message dispatch. cfg is the resolved provider config."""
+        tb = tb or {}
+        active_cfg, fallback_cfg, fallback_name, allow_fallback = self._route_request(anthropic_req, cfg)
+        if tb.get("used_fallback"):
+            # One failover hop only. Without this, a fallback provider that is
+            # itself a hybrid profile could ping-pong A -> B -> A forever.
+            allow_fallback = False
+            fallback_cfg = None
+
+        req_model = (anthropic_req.get("model") or "").lower()
         router_url = active_cfg.get("router_url", "https://inference.dahl.global/v1").rstrip("/")
         api_key = active_cfg.get("api_key", "").strip()
         
@@ -1072,7 +1218,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         # Build target OpenAI endpoint
         endpoint = f"{router_url}/chat/completions"
         auto_save_images = active_cfg.get("auto_save_images", True)
-        openai_req = convert_anthropic_to_openai(anthropic_req, target_model, auto_save_images=auto_save_images)
+        strip_images = active_cfg.get("strip_images", False) or router_rejects_inline_images(router_url)
+        openai_req = convert_anthropic_to_openai(anthropic_req, target_model,
+                                                 auto_save_images=auto_save_images,
+                                                 strip_images=strip_images)
 
         # Check payload size for routers with request body limits (e.g. Atria TokenPlan 850KB ceiling)
         is_atria = ("atria" in router_url.lower()) or ("atria" in (target_model or "").lower())
@@ -1107,12 +1256,16 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             openai_req["stream_options"] = {"include_usage": True}
         
         msg_id = f"msg_{uuid.uuid4().hex[:16]}"
-        
+
+        stream_started = False
+        last_retry_err = ""
         try:
             client = _get_client()
             if is_stream:
                 # Stream response
-                with client.stream("POST", endpoint, headers=req_headers, json=openai_req) as resp:
+                with client.stream("POST", endpoint, headers=req_headers, json=openai_req,
+                                  timeout=httpx.Timeout(connect=10.0, read=STREAM_IDLE_TIMEOUT,
+                                                       write=60.0, pool=10.0)) as resp:
                     # 1. Multi-key failover retry on 429/402
                     if resp.status_code in (429, 402) and multi_key_enabled and len(api_keys) > 1:
                         for alt_key in [k for k in api_keys if k != current_key]:
@@ -1138,15 +1291,52 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                 req_headers = alt_headers
                                 break
                             else:
+                                # Keep the last retry's error body for the report
+                                # below; the loop may exhaust with every key
+                                # limited, leaving the original resp closed.
+                                try:
+                                    last_retry_err = retry_resp.read().decode("utf-8", errors="replace")
+                                except Exception:
+                                    last_retry_err = ""
                                 try:
                                     retry_ctx.__exit__(None, None, None)
                                 except Exception:
                                     pass
 
                     if resp.status_code != 200:
-                        err_body = resp.read().decode("utf-8", errors="replace")
+                        try:
+                            err_body = resp.read().decode("utf-8", errors="replace")
+                        except Exception:
+                            # Response was closed by the key-rotation loop above.
+                            err_body = last_retry_err or json.dumps(
+                                {"error": f"Router returned HTTP {resp.status_code}"})
                         is_size_err = ("not supported by TokenPlan" in err_body or resp.status_code == 413 or "too large" in err_body.lower())
-                        if is_size_err and len(openai_req.get("messages", [])) > 2:
+                        # Some OpenAI-style routers (e.g. Dahl) reject inline
+                        # image_url parts with a 400. Strip to paths and retry once.
+                        is_img_err = (resp.status_code == 400 and "image" in err_body.lower()
+                                      and not router_rejects_inline_images(router_url))
+                        if is_img_err:
+                            mark_router_rejects_inline_images(router_url)
+                            self.emit_log(f"Router rejected inline images ({resp.status_code}). Retrying with images as file paths; future requests will skip inline images for this router.")
+                            openai_req = strip_inline_images(openai_req)
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                            retry_ctx = client.stream("POST", endpoint, headers=req_headers, json=openai_req)
+                            retry_resp = retry_ctx.__enter__()
+                            if retry_resp.status_code == 200:
+                                resp = retry_resp
+                            else:
+                                try:
+                                    err_body = retry_resp.read().decode("utf-8", errors="replace")
+                                except Exception:
+                                    err_body = ""
+                                try:
+                                    retry_ctx.__exit__(None, None, None)
+                                except Exception:
+                                    pass
+                        elif is_size_err and len(openai_req.get("messages", [])) > 2:
                             self.emit_log(f"Router rejected payload ({resp.status_code}): TokenPlan limit reached. Rescuing with compacted context...")
                             openai_req["messages"] = trim_openai_messages(openai_req["messages"], max_bytes=450_000)
                             try:
@@ -1165,47 +1355,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                     pass
 
                         if resp.status_code != 200:
-                            # Router fallback
+                            # Router fallback (429/402/5xx/all) via unified router
                             if allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
-                                self.emit_log(f"Router Error ({resp.status_code}): Failing over to fallback router [{fallback_name}]...")
                                 try:
                                     resp.close()
                                 except Exception:
                                     pass
-                                fb_url = fallback_cfg.get("router_url", "").rstrip("/")
-                                fb_key = fallback_cfg.get("api_key", "").strip()
-                                fb_model = fallback_cfg.get("model", target_model).strip()
-                                fb_is_anthropic = ("agentrouter" in fb_url.lower()) or ("anthropic.com" in fb_url.lower()) or (fallback_cfg.get("protocol") == "anthropic")
-                                if fb_is_anthropic:
-                                    self._handle_anthropic_native(anthropic_req, fb_model, fb_url, fb_key, fallback_cfg, allow_fallback=False)
-                                    return
-                                else:
-                                    fb_endpoint = f"{fb_url}/chat/completions"
-                                    fb_req = convert_anthropic_to_openai(anthropic_req, fb_model, auto_save_images=fallback_cfg.get("auto_save_images", True))
-                                    fb_req["stream"] = is_stream
-                                    if is_stream:
-                                        fb_req["stream_options"] = {"include_usage": True}
-                                    fb_keys = parse_api_keys(fb_key)
-                                    fb_cur_key = select_api_key(fb_url, fb_keys, fallback_cfg.get("multi_key_rotation", True))
-                                    fb_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {fb_cur_key}" if fb_cur_key else ""}
-                                    fb_ctx = client.stream("POST", fb_endpoint, headers=fb_headers, json=fb_req)
-                                    fb_resp = fb_ctx.__enter__()
-                                    if fb_resp.status_code == 200:
-                                        resp = fb_resp
-                                    else:
-                                        fb_err = fb_resp.read().decode("utf-8", errors="replace")
-                                        try:
-                                            fb_ctx.__exit__(None, None, None)
-                                        except Exception:
-                                            pass
-                                        self.emit_log(f"Fallback Router Error ({fb_resp.status_code}): {fb_err}")
-                                        self.send_response(fb_resp.status_code)
-                                        self.send_header("Content-Type", "application/json")
-                                        self.send_header("Content-Length", str(len(fb_err.encode("utf-8"))))
-                                        self.send_header("Access-Control-Allow-Origin", "*")
-                                        self.end_headers()
-                                        self.wfile.write(fb_err.encode("utf-8"))
-                                        return
+                                self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
+                                return
                             else:
                                 self.emit_log(f"Router Error ({resp.status_code}): {err_body}")
                                 self.send_response(resp.status_code)
@@ -1223,6 +1380,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     self.close_connection = True
+                    stream_started = True
 
                     # 1. Start message event
                     start_evt = {
@@ -1579,40 +1737,24 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 if resp.status_code != 200:
                     err_body = resp.text
                     is_size_err = ("not supported by TokenPlan" in err_body or resp.status_code == 413 or "too large" in err_body.lower())
-                    if is_size_err and len(openai_req.get("messages", [])) > 2:
+                    # Inline-image rejection: strip to paths and retry once.
+                    is_img_err = (resp.status_code == 400 and "image" in err_body.lower()
+                                  and not router_rejects_inline_images(router_url))
+                    if is_img_err:
+                        mark_router_rejects_inline_images(router_url)
+                        self.emit_log(f"Router rejected inline images ({resp.status_code}). Retrying with images as file paths; future requests will skip inline images for this router.")
+                        openai_req = strip_inline_images(openai_req)
+                        resp = client.post(endpoint, headers=req_headers, json=openai_req)
+                    elif is_size_err and len(openai_req.get("messages", [])) > 2:
                         self.emit_log(f"Router rejected non-streaming payload ({resp.status_code}): TokenPlan limit reached. Rescuing with compacted context...")
                         openai_req["messages"] = trim_openai_messages(openai_req["messages"], max_bytes=450_000)
                         resp = client.post(endpoint, headers=req_headers, json=openai_req)
 
                 if resp.status_code != 200:
                     if allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
-                        self.emit_log(f"Router Error ({resp.status_code}): Failing over to fallback router [{fallback_name}]...")
-                        fb_url = fallback_cfg.get("router_url", "").rstrip("/")
-                        fb_key = fallback_cfg.get("api_key", "").strip()
-                        fb_model = fallback_cfg.get("model", target_model).strip()
-                        fb_is_anthropic = ("agentrouter" in fb_url.lower()) or ("anthropic.com" in fb_url.lower()) or (fallback_cfg.get("protocol") == "anthropic")
-                        if fb_is_anthropic:
-                            self._handle_anthropic_native(anthropic_req, fb_model, fb_url, fb_key, fallback_cfg, allow_fallback=False)
-                            return
-                        else:
-                            fb_endpoint = f"{fb_url}/chat/completions"
-                            fb_req = convert_anthropic_to_openai(anthropic_req, fb_model, auto_save_images=fallback_cfg.get("auto_save_images", True))
-                            fb_req["stream"] = False
-                            fb_keys = parse_api_keys(fb_key)
-                            fb_cur_key = select_api_key(fb_url, fb_keys, fallback_cfg.get("multi_key_rotation", True))
-                            fb_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {fb_cur_key}" if fb_cur_key else ""}
-                            fb_resp = client.post(fb_endpoint, headers=fb_headers, json=fb_req)
-                            if fb_resp.status_code == 200:
-                                resp = fb_resp
-                            else:
-                                self.emit_log(f"Fallback Router Error ({fb_resp.status_code}): {fb_resp.text}")
-                                self.send_response(fb_resp.status_code)
-                                self.send_header("Content-Type", "application/json")
-                                self.send_header("Content-Length", str(len(fb_resp.content)))
-                                self.send_header("Access-Control-Allow-Origin", "*")
-                                self.end_headers()
-                                self.wfile.write(fb_resp.content)
-                                return
+                        self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
+                        return
+
                     else:
                         self.emit_log(f"Router Error ({resp.status_code}): {resp.text}")
                         self.send_response(resp.status_code)
@@ -1701,6 +1843,78 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
         except Exception as ex:
+            # If the 200 + message_start already went out, a 500 is no longer a
+            # valid HTTP response: close the SSE turn so Claude Code resumes
+            # instead of waiting on a stream that will never emit a stop event.
+            if stream_started:
+                self._close_sse_stream(
+                    f"Upstream stream failed mid-response ({type(ex).__name__}: {ex}); "
+                    f"closing turn so Claude Code can continue."
+                )
+                return
+            self.emit_log(f"Proxy Connection Error: {str(ex)}")
+            try:
+                payload = json.dumps({"error": str(ex)}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception:
+                pass
+
+    def do_POST(self):
+        # Claude Code sends Expect: 100-continue on large bodies. Answer it or
+        # the client stalls waiting for the go-ahead before sending its payload.
+        if self.headers.get("Expect", "").lower() == "100-continue":
+            self.send_response_only(100)
+            self.end_headers()
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+
+        if self.path.startswith("/v1/messages/count_tokens"):
+            # Estimate tokens roughly
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            tokens = max(1, len(body) // 4)
+            payload = json.dumps({"input_tokens": tokens}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if not self.path.startswith("/v1/messages"):
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        # Handle /v1/messages
+        # Handle /v1/messages
+        content_length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(content_length)
+
+        try:
+            anthropic_req = json.loads(raw_body.decode("utf-8"))
+        except Exception as e:
+            payload = json.dumps({"error": str(e)}).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        try:
+            cfg = self.config_getter() if self.config_getter else {}
+            self._handle_messages(anthropic_req, cfg)
+        except Exception as ex:
             self.emit_log(f"Proxy Connection Error: {str(ex)}")
             try:
                 payload = json.dumps({"error": str(ex)}).encode("utf-8")
@@ -1715,6 +1929,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
 
 class ProxyServer:
+
     def __init__(self, port=4000, config_getter=None, log_callback=None):
         self.port = port
         self.config_getter = config_getter

@@ -172,17 +172,6 @@ Claude Code  ──Anthropic format──►  ClaudeBridge (localhost:4000)
 - **Vision** — Anthropic `image` blocks become `image_url` entries; base64 payloads are auto-saved to a temp folder and referenced by path for providers that reject inline images.
 - **Fallback** — on a primary 4xx/5xx or connection failure, the hybrid router retries the request on the secondary before surfacing an error.
 
-## 🧪 Tests
-
-```bash
-python test_proxy.py        # request translation & max_tokens clamping
-python test_context.py      # token counter & compaction trimming
-python test_autocompact.py  # auto-compact gate behavior
-python test_vision.py       # image conversion & disk save
-```
-
-Each is a self-contained script — no test framework required, exits non-zero on failure.
-
 ## 🛠 Troubleshooting
 
 <details>

@@ -14,8 +14,16 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = io.StringIO()
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk
 import pystray
+
+def get_resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
 
 from proxy_engine import (
     ProxyServer,
@@ -23,10 +31,11 @@ from proxy_engine import (
     DEFAULT_CONTEXT_LENGTH,
     get_token_stats,
     reset_token_stats,
+    parse_api_keys,
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.3.1"
 
 # Configuration paths
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ClaudeBridge")
@@ -92,7 +101,18 @@ def get_default_config():
         "auto_start": True,
         "thinking_mode": "thinking_block",
         "context_length": DEFAULT_CONTEXT_LENGTH,
-        "auto_compact_window": True
+        "auto_compact_window": True,
+        # True = replace attached images with a disk path (routers that reject
+        # inline image data or cap the request body, e.g. Atria TokenPlan).
+        "strip_images": False,
+        # Hybrid routing between two provider profiles. Off by default: enabling
+        # it sends Haiku/vision to the secondary and Sonnet/Opus to the primary.
+        "enable_hybrid_router": False,
+        "hybrid_primary_provider": "",
+        "hybrid_secondary_provider": "",
+        "hybrid_fallback": True,
+        "multi_key_rotation": True,
+        "boot_to_tray": True
     }
 
 
@@ -107,7 +127,10 @@ def load_config():
                 if "active_provider" in data and data["active_provider"] in defaults["providers"]:
                     defaults["active_provider"] = data["active_provider"]
                 for k in ("port", "minimize_to_tray", "auto_start", "thinking_mode",
-                          "context_length", "auto_compact_window"):
+                          "context_length", "auto_compact_window", "strip_images",
+                          "enable_hybrid_router", "hybrid_primary_provider",
+                          "hybrid_secondary_provider", "hybrid_fallback",
+                          "multi_key_rotation", "boot_to_tray"):
                     if k in data:
                         defaults[k] = data[k]
         except Exception:
@@ -125,7 +148,20 @@ def save_config(cfg):
 
 
 def create_tray_image(is_running=False):
-    """Generate a clean tray icon dynamically."""
+    """Generate a clean tray icon dynamically or from logo asset."""
+    logo_path = get_resource_path(os.path.join("assets", "logo.png"))
+    if os.path.exists(logo_path):
+        try:
+            base_img = Image.open(logo_path).convert("RGBA").resize((64, 64), Image.Resampling.LANCZOS)
+            draw = ImageDraw.Draw(base_img)
+            dot_color = (16, 185, 129, 255) if is_running else (239, 68, 68, 255)
+            # Crisp outline ring and status dot in bottom-right corner
+            draw.ellipse((42, 42, 62, 62), fill=(255, 255, 255, 255))
+            draw.ellipse((44, 44, 60, 60), fill=dot_color)
+            return base_img
+        except Exception:
+            pass
+
     width = 64
     height = 64
     image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -148,11 +184,30 @@ class ClaudeBridgeApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"Claude Bridge v{APP_VERSION} — Multi-Provider Router Proxy")
-        self.root.geometry("660 x 820".replace(" ", ""))
-        self.root.minsize(600, 740)
+        self.root.geometry("1200x760")
+        self.root.minsize(1040, 640)
         self.root.configure(bg="#18181b")
 
-        # Set taskbar icon
+        # Set window icon and taskbar icon
+        ico_path = get_resource_path(os.path.join("assets", "icon.ico"))
+        logo_path = get_resource_path(os.path.join("assets", "logo.png"))
+        if os.path.exists(ico_path):
+            try:
+                self.root.iconbitmap(default=ico_path)
+            except Exception:
+                try:
+                    self.root.iconbitmap(ico_path)
+                except Exception:
+                    pass
+
+        if os.path.exists(logo_path):
+            try:
+                logo_pil = Image.open(logo_path).convert("RGBA")
+                self._app_window_icon = ImageTk.PhotoImage(logo_pil)
+                self.root.iconphoto(True, self._app_window_icon)
+            except Exception:
+                pass
+
         self.icon_image = create_tray_image(False)
         self.tray_icon = None
         self.proxy_server = None
@@ -195,13 +250,26 @@ class ClaudeBridgeApp:
         self.style.map("TCombobox", fieldbackground=[("readonly", "#18181b")])
 
     def _build_ui(self):
-        # Main container with padding
-        main_frame = tk.Frame(self.root, bg="#18181b", padx=20, pady=16)
+        # Horizontal layout: config column on the left, live log column on the
+        # right. The log previously sat at the bottom of one long stack and got
+        # squeezed to a sliver by every card above it.
+        main_frame = tk.Frame(self.root, bg="#18181b")
         main_frame.pack(fill="both", expand=True)
 
-        # Header Area
+        # ---- Header row -------------------------------------------------
         header_frame = tk.Frame(main_frame, bg="#18181b")
-        header_frame.pack(fill="x", pady=(0, 12))
+        header_frame.pack(fill="x", padx=16, pady=(12, 6))
+
+        # Logo thumbnail in header
+        logo_path = get_resource_path(os.path.join("assets", "logo.png"))
+        if os.path.exists(logo_path):
+            try:
+                logo_pil = Image.open(logo_path).convert("RGBA").resize((38, 38), Image.Resampling.LANCZOS)
+                self.logo_photo = ImageTk.PhotoImage(logo_pil)
+                logo_lbl = tk.Label(header_frame, image=self.logo_photo, bg="#18181b", bd=0, highlightthickness=0)
+                logo_lbl.pack(side="left", padx=(0, 10))
+            except Exception:
+                pass
 
         title_box = tk.Frame(header_frame, bg="#18181b")
         title_box.pack(side="left")
@@ -209,29 +277,118 @@ class ClaudeBridgeApp:
         title_lbl = ttk.Label(title_box, text="Claude Bridge", style="Header.TLabel")
         title_lbl.pack(anchor="w")
 
-        sub_lbl = ttk.Label(title_box, text="Multi-Provider OpenAI ➜ Anthropic Messages Router", style="SubHeader.TLabel")
+        sub_lbl = ttk.Label(title_box, text="Multi-Provider OpenAI → Anthropic Messages Router", style="SubHeader.TLabel")
         sub_lbl.pack(anchor="w")
 
-        # Status badge
         self.status_badge = tk.Label(
-            header_frame,
-            text="● STOPPED",
-            font=("Segoe UI", 9, "bold"),
-            bg="#ef4444",
-            fg="#ffffff",
-            padx=10,
-            pady=4,
-            relief="flat"
+            header_frame, text="● STOPPED",
+            font=("Segoe UI", 9, "bold"), bg="#ef4444", fg="#ffffff",
+            padx=10, pady=4, relief="flat"
         )
         self.status_badge.pack(side="right", pady=4)
 
-        # Configuration Card Frame
-        card = tk.Frame(main_frame, bg="#27272a", padx=16, pady=14, highlightbackground="#3f3f46", highlightthickness=1)
-        card.pack(fill="x", pady=(0, 10))
+        # ---- Toolbar row: start/stop + Claude Code wiring ----------------
+        toolbar = tk.Frame(main_frame, bg="#18181b")
+        toolbar.pack(fill="x", padx=16, pady=(0, 6))
+
+        self.start_btn = tk.Button(
+            toolbar, text="▶  START PROXY", command=self.toggle_proxy,
+            font=("Segoe UI", 10, "bold"), bg="#10b981", fg="#ffffff",
+            activebackground="#059669", activeforeground="#ffffff",
+            relief="flat", pady=6, cursor="hand2"
+        )
+        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        sync_btn = tk.Button(
+            toolbar, text="⚡ Configure Claude Code", command=self.configure_claude_settings,
+            font=("Segoe UI", 9, "bold"), bg="#3b82f6", fg="#ffffff",
+            activebackground="#2563eb", activeforeground="#ffffff",
+            relief="flat", padx=10, pady=6, cursor="hand2"
+        )
+        sync_btn.pack(side="left", padx=(0, 6))
+
+        restore_btn = tk.Button(
+            toolbar, text="🔄 Restore Original", command=self.restore_claude_settings,
+            font=("Segoe UI", 9), bg="#52525b", fg="#ffffff",
+            activebackground="#71717a", activeforeground="#ffffff",
+            relief="flat", padx=10, pady=6, cursor="hand2"
+        )
+        restore_btn.pack(side="left", padx=(0, 6))
+
+        self.tray_btn = tk.Button(
+            toolbar, text="🗕 Minimize to Tray", command=self.minimize_to_tray,
+            font=("Segoe UI", 9), bg="#3f3f46", fg="#ffffff",
+            activebackground="#52525b", activeforeground="#ffffff",
+            relief="flat", padx=10, pady=6, cursor="hand2"
+        )
+        self.tray_btn.pack(side="left", padx=(0, 6))
+
+        self.quit_btn = tk.Button(
+            toolbar, text="✕ Close & Exit", command=self.quit_app,
+            font=("Segoe UI", 9), bg="#dc2626", fg="#ffffff",
+            activebackground="#b91c1c", activeforeground="#ffffff",
+            relief="flat", padx=10, pady=6, cursor="hand2"
+        )
+        self.quit_btn.pack(side="right")
+
+        # ---- Two-column body --------------------------------------------
+        # Balanced split; both columns expand to fill space and attach naturally
+        body = tk.Frame(main_frame, bg="#18181b")
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        # LEFT: scrollable configuration column
+        left_pane = tk.Frame(body, bg="#18181b")
+        canvas = tk.Canvas(left_pane, bg="#18181b", highlightthickness=0, bd=0)
+        vbar = ttk.Scrollbar(left_pane, orient="vertical", command=canvas.yview)
+
+        def _on_yscroll(lo, hi):
+            flo, fhi = float(lo), float(hi)
+            if flo <= 0.0 and fhi >= 1.0:
+                vbar.pack_forget()
+            else:
+                if not vbar.winfo_ismapped():
+                    vbar.pack(side="right", fill="y")
+            vbar.set(lo, hi)
+
+        canvas.configure(yscrollcommand=_on_yscroll)
+
+        cfg_inner = tk.Frame(canvas, bg="#18181b", padx=2, pady=0)
+        canvas.create_window((0, 0), window=cfg_inner, anchor="nw", tags="inner")
+
+        def _on_inner_configure(_e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        cfg_inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(e):
+            canvas.itemconfig("inner", width=e.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Wheel scrolling only while the pointer is over the config column, so
+        # the log keeps its own scroll.
+        def _wheel(e):
+            try:
+                x, y = e.x_root, e.y_root
+                lx = left_pane.winfo_rootx()
+                ly = left_pane.winfo_rooty()
+                lw = left_pane.winfo_width()
+                lh = left_pane.winfo_height()
+                if lx <= x <= lx + lw and ly <= y <= ly + lh:
+                    canvas.yview_scroll(int(-e.delta / 120), "units")
+            except Exception:
+                pass
+        canvas.bind_all("<MouseWheel>", _wheel)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        left_pane.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+
+        card = cfg_inner  # keep the rest of the builder readable
 
         # --- Provider Profiles Selection Bar ---
         profile_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3b82f6", highlightthickness=1)
-        profile_frame.pack(fill="x", pady=(0, 10))
+        profile_frame.pack(fill="x", pady=(0, 8))
 
         tk.Label(profile_frame, text="Active Provider:", font=("Segoe UI", 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(side="left", padx=(0, 8))
 
@@ -272,8 +429,8 @@ class ClaudeBridgeApp:
         cur_p_data = self.cfg.get("providers", {}).get(active_p, {})
 
         # 1. Router URL
-        url_frame = tk.Frame(card, bg="#27272a")
-        url_frame.pack(fill="x", pady=3)
+        url_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
+        url_frame.pack(fill="x", pady=(0, 8))
         ttk.Label(url_frame, text="Router URL (OpenAI Base URL):", style="FieldLabel.TLabel").pack(anchor="w")
         self.url_var = tk.StringVar(value=cur_p_data.get("router_url", "https://inference.dahl.global/v1"))
         self.url_entry = tk.Entry(
@@ -283,17 +440,17 @@ class ClaudeBridgeApp:
         self.url_entry.pack(fill="x", pady=(2, 0), ipady=4)
 
         # 2. API Key
-        key_frame = tk.Frame(card, bg="#27272a")
-        key_frame.pack(fill="x", pady=3)
-        
-        key_header = tk.Frame(key_frame, bg="#27272a")
+        key_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
+        key_frame.pack(fill="x", pady=(0, 8))
+
+        key_header = tk.Frame(key_frame, bg="#1e1e24")
         key_header.pack(fill="x")
-        ttk.Label(key_header, text="API Key:", style="FieldLabel.TLabel").pack(side="left", anchor="w")
-        
+        ttk.Label(key_header, text="API Key  (multiple: comma-separated, round-robin)", style="FieldLabel.TLabel").pack(side="left", anchor="w")
+
         self.show_key_var = tk.BooleanVar(value=False)
         show_btn = tk.Checkbutton(
             key_header, text="Show", variable=self.show_key_var, command=self._toggle_key_visibility,
-            bg="#27272a", fg="#a1a1aa", activebackground="#27272a", selectcolor="#18181b", relief="flat", font=("Segoe UI", 8)
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b", relief="flat", font=("Segoe UI", 8)
         )
         show_btn.pack(side="right")
 
@@ -304,12 +461,29 @@ class ClaudeBridgeApp:
         )
         self.key_entry.pack(fill="x", pady=(2, 0), ipady=4)
 
-        # 3. Model & Port Row
-        row_frame = tk.Frame(card, bg="#27272a")
-        row_frame.pack(fill="x", pady=3)
+        # Live key-pool readout: confirms the comma-separated keys are actually
+        # being picked up and rotated, rather than guessing from the masked box.
+        self.key_pool_lbl = tk.Label(key_frame, text="", font=("Segoe UI", 8), bg="#1e1e24", fg="#71717a")
+        self.key_pool_lbl.pack(anchor="w", pady=(2, 0))
 
-        # Model
-        m_col = tk.Frame(row_frame, bg="#27272a")
+        def _refresh_key_pool(*_a):
+            keys = parse_api_keys(self.key_var.get())
+            n = len(keys)
+            if n <= 1:
+                self.key_pool_lbl.configure(text="1 key in pool" if n else "No API key set")
+            else:
+                self.key_pool_lbl.configure(
+                    text=f"{n} keys in round-robin pool - active now: ...{keys[0][-4:]}"
+                )
+
+        self.key_var.trace_add("write", _refresh_key_pool)
+        _refresh_key_pool()
+
+        # 3. Model & Port Row
+        row_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
+        row_frame.pack(fill="x", pady=(0, 8))
+
+        m_col = tk.Frame(row_frame, bg="#1e1e24")
         m_col.pack(side="left", fill="x", expand=True, padx=(0, 6))
         ttk.Label(m_col, text="Default / Custom Model Name:", style="FieldLabel.TLabel").pack(anchor="w")
         self.model_var = tk.StringVar(value=cur_p_data.get("model", "deepseek-ai/DeepSeek-V4-Flash-0731"))
@@ -319,8 +493,7 @@ class ClaudeBridgeApp:
         )
         self.model_entry.pack(fill="x", pady=(2, 0), ipady=4)
 
-        # Port
-        p_col = tk.Frame(row_frame, bg="#27272a")
+        p_col = tk.Frame(row_frame, bg="#1e1e24")
         p_col.pack(side="right", padx=(6, 0))
         ttk.Label(p_col, text="Local Port:", style="FieldLabel.TLabel").pack(anchor="w")
         self.port_var = tk.IntVar(value=self.cfg.get("port", 4000))
@@ -332,49 +505,104 @@ class ClaudeBridgeApp:
 
         # Multi-model mappings section for Claude Code dropdown
         mapping_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
-        mapping_frame.pack(fill="x", pady=(8, 0))
-        
+        mapping_frame.pack(fill="x", pady=(0, 8))
+
         tk.Label(mapping_frame, text="Claude Code Dropdown Model Mappings:", font=("Segoe UI", 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(anchor="w", pady=(0, 4))
-        
-        # Sonnet slot
+
         s_row = tk.Frame(mapping_frame, bg="#1e1e24")
         s_row.pack(fill="x", pady=2)
         tk.Label(s_row, text="Sonnet →", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
         self.sonnet_var = tk.StringVar(value=cur_p_data.get("sonnet_model", "deepseek-ai/DeepSeek-V4-Flash-0731"))
         tk.Entry(s_row, textvariable=self.sonnet_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
-        
-        # Opus slot
+
         o_row = tk.Frame(mapping_frame, bg="#1e1e24")
         o_row.pack(fill="x", pady=2)
         tk.Label(o_row, text="Opus →", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
         self.opus_var = tk.StringVar(value=cur_p_data.get("opus_model", "MiniMaxAI/MiniMax-M2.7"))
         tk.Entry(o_row, textvariable=self.opus_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
 
-        # Haiku slot
         h_row = tk.Frame(mapping_frame, bg="#1e1e24")
         h_row.pack(fill="x", pady=2)
         tk.Label(h_row, text="Haiku →", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
         self.haiku_var = tk.StringVar(value=cur_p_data.get("haiku_model", "zai-org/GLM-5.3-Flash"))
         tk.Entry(h_row, textvariable=self.haiku_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
 
-        # Context Window (autodetected from the provider; user-editable)
-        ctx_frame = tk.Frame(card, bg="#27272a")
-        ctx_frame.pack(fill="x", pady=3)
+        # --- Hybrid Multi-Router ---
+        hybrid_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
+        hybrid_frame.pack(fill="x", pady=(0, 8))
 
-        ctx_head = tk.Frame(ctx_frame, bg="#27272a")
+        h_head = tk.Frame(hybrid_frame, bg="#1e1e24")
+        h_head.pack(fill="x")
+        tk.Label(h_head, text="Hybrid Multi-Router:", font=("Segoe UI", 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(side="left")
+
+        self.hybrid_var = tk.BooleanVar(value=self.cfg.get("enable_hybrid_router", False))
+        tk.Checkbutton(
+            h_head, text="Enable", variable=self.hybrid_var, command=self._persist_options, bg="#1e1e24", fg="#a1a1aa",
+            activebackground="#1e1e24", selectcolor="#18181b", relief="flat", font=("Segoe UI", 8)
+        ).pack(side="left", padx=(10, 0))
+
+        prov_names = list(self.cfg.get("providers", {}).keys())
+
+        def _default_prov(idx, fallback_key):
+            saved = self.cfg.get(fallback_key)
+            if saved in prov_names:
+                return saved
+            if prov_names:
+                return prov_names[min(idx, len(prov_names) - 1)]
+            return ""
+
+        h_row2 = tk.Frame(hybrid_frame, bg="#1e1e24")
+        h_row2.pack(fill="x", pady=(4, 0))
+        tk.Label(h_row2, text="Primary:", width=8, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
+        self.hybrid_primary_var = tk.StringVar(value=_default_prov(0, "hybrid_primary_provider"))
+        ttk.Combobox(h_row2, textvariable=self.hybrid_primary_var, values=prov_names, state="readonly", width=16, font=("Segoe UI", 8)).pack(side="left", padx=(0, 10))
+        tk.Label(h_row2, text="Secondary:", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
+        self.hybrid_secondary_var = tk.StringVar(value=_default_prov(1, "hybrid_secondary_provider"))
+        # ttk widgets have no command=; the selection event is the persistence hook.
+        for _cb in h_row2.winfo_children():
+            if isinstance(_cb, ttk.Combobox):
+                _cb.bind("<<ComboboxSelected>>", lambda _e: self._persist_options())
+        ttk.Combobox(h_row2, textvariable=self.hybrid_secondary_var, values=prov_names, state="readonly", width=16, font=("Segoe UI", 8)).pack(side="left")
+
+        h_opts = tk.Frame(hybrid_frame, bg="#1e1e24")
+        h_opts.pack(fill="x", pady=(4, 0))
+        self.hybrid_fallback_var = tk.BooleanVar(value=self.cfg.get("hybrid_fallback", True))
+        tk.Checkbutton(
+            h_opts, text="Failover on error (incl. 520-524)", variable=self.hybrid_fallback_var, command=self._persist_options,
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b",
+            relief="flat", font=("Segoe UI", 8)
+        ).pack(side="left")
+        self.multi_key_var = tk.BooleanVar(value=self.cfg.get("multi_key_rotation", True))
+        tk.Checkbutton(
+            h_opts, text="Rotate API keys", variable=self.multi_key_var, command=self._persist_options,
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b",
+            relief="flat", font=("Segoe UI", 8)
+        ).pack(side="left", padx=(8, 0))
+        self.strip_images_var = tk.BooleanVar(value=self.cfg.get("strip_images", False))
+        tk.Checkbutton(
+            h_opts, text="Strip images", variable=self.strip_images_var, command=self._persist_options,
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b",
+            relief="flat", font=("Segoe UI", 8)
+        ).pack(side="left", padx=(8, 0))
+
+        # Context Window (autodetected from the provider; user-editable)
+        ctx_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
+        ctx_frame.pack(fill="x", pady=(0, 8))
+
+        ctx_head = tk.Frame(ctx_frame, bg="#1e1e24")
         ctx_head.pack(fill="x")
         ttk.Label(ctx_head, text="Context Window (tokens):", style="FieldLabel.TLabel").pack(side="left")
 
         self.auto_ctx_var = tk.BooleanVar(value=self.cfg.get("auto_compact_window", True))
         auto_ctx_check = tk.Checkbutton(
-            ctx_head, text="Apply to Claude Code (auto-compact at this limit)",
-            variable=self.auto_ctx_var,
-            bg="#27272a", fg="#a1a1aa", activebackground="#27272a", selectcolor="#18181b",
+            ctx_head, text="Auto-compact at this limit",
+            variable=self.auto_ctx_var, command=self._persist_options,
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b",
             relief="flat", font=("Segoe UI", 8)
         )
         auto_ctx_check.pack(side="right")
 
-        ctx_row = tk.Frame(ctx_frame, bg="#27272a")
+        ctx_row = tk.Frame(ctx_frame, bg="#1e1e24")
         ctx_row.pack(fill="x", pady=(2, 0))
 
         self.ctx_var = tk.StringVar(value=str(self.cfg.get("context_length", DEFAULT_CONTEXT_LENGTH)))
@@ -387,9 +615,9 @@ class ClaudeBridgeApp:
         self.ctx_entry.bind("<FocusOut>", lambda e: self._normalize_ctx_entry())
 
         self.ctx_source_lbl = tk.Label(
-            ctx_row, text="", font=("Segoe UI", 8), bg="#27272a", fg="#71717a"
+            ctx_row, text="", font=("Segoe UI", 8), bg="#1e1e24", fg="#71717a", wraplength=220, justify="left"
         )
-        self.ctx_source_lbl.pack(side="left", padx=(8, 0))
+        self.ctx_source_lbl.pack(side="left", padx=(8, 0), fill="x", expand=True)
 
         fetch_ctx_btn = tk.Button(
             ctx_row, text="🔄 Auto-detect", command=self.fetch_context_length,
@@ -398,10 +626,10 @@ class ClaudeBridgeApp:
         )
         fetch_ctx_btn.pack(side="right")
 
-        # Thinking & Reasoning Handling inside card
-        t_row = tk.Frame(card, bg="#27272a")
-        t_row.pack(fill="x", pady=(8, 2))
-        ttk.Label(t_row, text="Thinking / Reasoning:", style="FieldLabel.TLabel").pack(side="left", padx=(0, 6))
+        # Thinking & Reasoning Handling
+        t_row = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
+        t_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(t_row, text="Thinking / Reasoning:", style="FieldLabel.TLabel").pack(anchor="w")
         self.thinking_mode_var = tk.StringVar()
         self.thinking_combo = ttk.Combobox(
             t_row, textvariable=self.thinking_mode_var, state="readonly", font=("Segoe UI", 9)
@@ -418,84 +646,93 @@ class ClaudeBridgeApp:
             "raw": "Raw in Chat (No Filtering)"
         }
         self.thinking_mode_var.set(mode_label_map.get(current_mode, "Separate Thinking Block (Claude UI Collapsible)"))
-        self.thinking_combo.pack(side="left", fill="x", expand=True)
+        self.thinking_combo.pack(fill="x", pady=(2, 0))
         self.thinking_combo.bind("<<ComboboxSelected>>", self._on_thinking_mode_changed)
 
-        # Action Buttons Row
-        action_frame = tk.Frame(main_frame, bg="#18181b")
-        action_frame.pack(fill="x", pady=(0, 8))
-
-        self.start_btn = tk.Button(
-            action_frame, text="▶  START PROXY", command=self.toggle_proxy,
-            font=("Segoe UI", 11, "bold"), bg="#10b981", fg="#ffffff", activebackground="#059669", activeforeground="#ffffff",
-            relief="flat", pady=8, cursor="hand2"
-        )
-        self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
-
-        self.tray_btn = tk.Button(
-            action_frame, text="🗕 Minimize to Tray", command=self.minimize_to_tray,
-            font=("Segoe UI", 9), bg="#3f3f46", fg="#ffffff", activebackground="#52525b", activeforeground="#ffffff",
-            relief="flat", padx=10, pady=8, cursor="hand2"
-        )
-        self.tray_btn.pack(side="left", padx=(0, 6))
-
-        self.quit_btn = tk.Button(
-            action_frame, text="✕ Close & Exit", command=self.quit_app,
-            font=("Segoe UI", 9), bg="#dc2626", fg="#ffffff", activebackground="#b91c1c", activeforeground="#ffffff",
-            relief="flat", padx=10, pady=8, cursor="hand2"
-        )
-        self.quit_btn.pack(side="right")
-
-        # Claude Code Connection Bar
-        claude_frame = tk.Frame(main_frame, bg="#27272a", padx=12, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
-        claude_frame.pack(fill="x", pady=(0, 8))
-
-        ttk.Label(claude_frame, text="Claude Code Setup:", style="FieldLabel.TLabel").pack(side="left", padx=(0, 8))
-
-        sync_btn = tk.Button(
-            claude_frame, text="⚡ Configure Claude Code Settings", command=self.configure_claude_settings,
-            font=("Segoe UI", 8, "bold"), bg="#3b82f6", fg="#ffffff", activebackground="#2563eb", activeforeground="#ffffff",
-            relief="flat", padx=8, pady=3, cursor="hand2"
-        )
-        sync_btn.pack(side="left", padx=3)
-
-        restore_btn = tk.Button(
-            claude_frame, text="🔄 Restore Original", command=self.restore_claude_settings,
-            font=("Segoe UI", 8), bg="#52525b", fg="#ffffff", activebackground="#71717a", activeforeground="#ffffff",
-            relief="flat", padx=8, pady=3, cursor="hand2"
-        )
-        restore_btn.pack(side="left", padx=3)
-
-        # Options Row
-        opts_frame = tk.Frame(main_frame, bg="#18181b")
-        opts_frame.pack(fill="x", pady=(0, 6))
+        # App options
+        opts_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
+        opts_frame.pack(fill="x", pady=(0, 8))
 
         self.min_on_close_var = tk.BooleanVar(value=self.cfg.get("minimize_to_tray", True))
-        min_check = tk.Checkbutton(
-            opts_frame, text="Minimize to tray on close", variable=self.min_on_close_var,
-            bg="#18181b", fg="#a1a1aa", activebackground="#18181b", activeforeground="#ffffff", selectcolor="#27272a",
+        tk.Checkbutton(
+            opts_frame, text="Minimize to tray on close", variable=self.min_on_close_var, command=self._persist_options,
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", activeforeground="#ffffff", selectcolor="#18181b",
             relief="flat", font=("Segoe UI", 8)
-        )
-        min_check.pack(side="left", padx=(0, 10))
+        ).pack(anchor="w")
 
         self.auto_start_var = tk.BooleanVar(value=self.cfg.get("auto_start", True))
-        auto_check = tk.Checkbutton(
-            opts_frame, text="Auto-start proxy on launch", variable=self.auto_start_var,
-            bg="#18181b", fg="#a1a1aa", activebackground="#18181b", activeforeground="#ffffff", selectcolor="#27272a",
+        tk.Checkbutton(
+            opts_frame, text="Start proxy when app launches", variable=self.auto_start_var, command=self._persist_options,
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", activeforeground="#ffffff", selectcolor="#18181b",
+            relief="flat", font=("Segoe UI", 8)
+        ).pack(anchor="w")
+
+        # Boot registration. "auto_start" above only covers proxy start once the
+        # app is running; without this nothing launches the app itself at login,
+        # so the checkbox silently did nothing for boot. (Run key on Windows,
+        # LaunchAgent plist on macOS.)
+        self.launch_on_boot_var = tk.BooleanVar(value=self._boot_launch_enabled())
+        tk.Checkbutton(
+            opts_frame, text=f"Launch Claude Bridge when {'Windows' if sys.platform == 'win32' else 'the OS'} starts", variable=self.launch_on_boot_var,
+            command=self._toggle_boot_launch,
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", activeforeground="#ffffff", selectcolor="#18181b",
+            relief="flat", font=("Segoe UI", 8)
+        ).pack(anchor="w")
+
+        self.boot_tray_var = tk.BooleanVar(value=self.cfg.get("boot_to_tray", True))
+        boot_tray_check = tk.Checkbutton(
+            opts_frame, text="When launched at startup, stay minimized in tray",
+            variable=self.boot_tray_var,
+            command=self._sync_boot_launch_flag,
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", activeforeground="#ffffff", selectcolor="#18181b",
             relief="flat", font=("Segoe UI", 8)
         )
-        auto_check.pack(side="left")
+        # Only meaningful once boot launch is on.
+        if not self.launch_on_boot_var.get():
+            boot_tray_check.configure(state="disabled")
+        boot_tray_check.pack(anchor="w")
+
+        # RIGHT: live log column (always visible, gets the space)
+        right_pane = tk.Frame(body, bg="#27272a", padx=12, pady=10, highlightbackground="#3f3f46", highlightthickness=1)
+
+        log_head = tk.Frame(right_pane, bg="#27272a")
+        log_head.pack(fill="x", pady=(0, 6))
+
+        tk.Label(log_head, text="Activity Log", font=("Segoe UI", 10, "bold"), bg="#27272a", fg="#60a5fa").pack(side="left")
+
+        self.log_status_lbl = tk.Label(log_head, text="", font=("Segoe UI", 8), bg="#27272a", fg="#71717a")
+        self.log_status_lbl.pack(side="right")
 
         clear_btn = tk.Button(
-            opts_frame, text="Clear Log", command=self.clear_log,
-            bg="#18181b", fg="#71717a", activebackground="#18181b", activeforeground="#ffffff",
-            relief="flat", font=("Segoe UI", 8), cursor="hand2"
+            log_head, text="Clear", command=self.clear_log,
+            bg="#3f3f46", fg="#a1a1aa", activebackground="#52525b", activeforeground="#ffffff",
+            relief="flat", font=("Segoe UI", 8), padx=8, pady=1, cursor="hand2"
         )
-        clear_btn.pack(side="right")
+        clear_btn.pack(side="right", padx=(0, 8))
 
-        # Token Counter Bar
-        token_frame = tk.Frame(main_frame, bg="#27272a", padx=12, pady=6, highlightbackground="#3f3f46", highlightthickness=1)
-        token_frame.pack(fill="x", pady=(0, 8))
+        # Auto-scroll: follow the newest line unless the user is reading back.
+        self.auto_scroll_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            log_head, text="Auto-scroll", variable=self.auto_scroll_var,
+            bg="#27272a", fg="#a1a1aa", activebackground="#27272a", selectcolor="#18181b",
+            relief="flat", font=("Segoe UI", 8)
+        ).pack(side="right", padx=(0, 8))
+
+        self.log_area = scrolledtext.ScrolledText(
+            right_pane, wrap="word", font=("Consolas", 9),
+            bg="#0f0f11", fg="#a1a1aa", insertbackground="#ffffff", relief="flat",
+            padx=8, pady=6, bd=0, highlightthickness=0
+        )
+        self.log_area.tag_configure("info", foreground="#a1a1aa")
+        self.log_area.tag_configure("ok", foreground="#4ade80")
+        self.log_area.tag_configure("err", foreground="#f87171")
+        self.log_area.pack(fill="both", expand=True)
+        self.log_area.configure(state="disabled")
+        right_pane.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+        # Token counter bar under the log
+        token_frame = tk.Frame(right_pane, bg="#27272a")
+        token_frame.pack(fill="x", pady=(6, 0))
 
         tk.Label(
             token_frame, text="Tokens:", font=("Segoe UI", 9, "bold"), bg="#27272a", fg="#60a5fa"
@@ -514,39 +751,7 @@ class ClaudeBridgeApp:
         )
         reset_tokens_btn.pack(side="right")
 
-        # Activity Log Console
-        log_frame = tk.Frame(main_frame, bg="#27272a", highlightbackground="#3f3f46", highlightthickness=1)
-        log_frame.pack(fill="both", expand=True)
-
-        self.log_area = scrolledtext.ScrolledText(
-            log_frame, wrap="word", font=("Consolas", 9),
-            bg="#0f0f11", fg="#a1a1aa", insertbackground="#ffffff", relief="flat", padx=8, pady=6
-        )
-        self.log_area.pack(fill="both", expand=True)
-        self.log_area.configure(state="disabled")
-
         self.log(f"Claude Bridge v{APP_VERSION} initialized. Ready to start.")
-
-        # ponytail: 2s poll of a module-level dict. No per-request work and no
-        claude_frame.pack(fill="x", pady=(0, 8))
-
-        ttk.Label(claude_frame, text="Claude Code Setup:", style="FieldLabel.TLabel").pack(side="left", padx=(0, 8))
-
-        sync_btn = tk.Button(
-            claude_frame, text="⚡ Configure Claude Code Settings", command=self.configure_claude_settings,
-            font=("Segoe UI", 8, "bold"), bg="#3b82f6", fg="#ffffff", activebackground="#2563eb", activeforeground="#ffffff",
-            relief="flat", padx=8, pady=3, cursor="hand2"
-        )
-        sync_btn.pack(side="left", padx=3)
-
-        restore_btn = tk.Button(
-            claude_frame, text="🔄 Restore Original", command=self.restore_claude_settings,
-            font=("Segoe UI", 8), bg="#52525b", fg="#ffffff", activebackground="#71717a", activeforeground="#ffffff",
-            relief="flat", padx=8, pady=3, cursor="hand2"
-        )
-        restore_btn.pack(side="left", padx=3)
-
-        # Options Row
 
         # ponytail: 2s poll of a module-level dict. No per-request work and no
         # second event loop; the cost is one label update per tick.
@@ -557,6 +762,27 @@ class ClaudeBridgeApp:
         if self.cfg.get("auto_start", True):
             self.root.after(300, self.start_proxy)
 
+    def _refresh_token_display(self):
+        s = get_token_stats()
+        self.token_display.configure(
+            text=f"↑ {s['input']:,} · ↓ {s['output']:,} · Σ {s['total']:,} · {s['requests']} reqs"
+        )
+
+    def _poll_tokens(self):
+        """Background token counter refresh. Re-arms itself until the window dies."""
+        try:
+            self._refresh_token_display()
+        except Exception:
+            return
+        self.root.after(2000, self._poll_tokens)
+
+    def reset_token_counter(self):
+        reset_token_stats()
+        self._refresh_token_display()
+        self.log("Token counter reset to zero.")
+
+    def _on_provider_selected(self, event=None):
+        p_name = self.provider_var.get()
         p_data = self.cfg.get("providers", {}).get(p_name, {})
         if not p_data:
             return
@@ -567,6 +793,20 @@ class ClaudeBridgeApp:
         self.sonnet_var.set(p_data.get("sonnet_model", p_data.get("model", "")))
         self.opus_var.set(p_data.get("opus_model", p_data.get("model", "")))
         self.haiku_var.set(p_data.get("haiku_model", p_data.get("model", "")))
+
+        # Legacy hybrid profiles carry their routing setup inside the profile
+        # (is_hybrid/primary_provider/secondary_provider). Mirror it into the
+        # Hybrid panel so selecting such a profile actually enables hybrid mode;
+        # the global checkbox alone previously stayed off and every request
+        # went to a single router.
+        if p_data.get("is_hybrid"):
+            self.hybrid_var.set(True)
+            provs = list(self.cfg.get("providers", {}).keys())
+            if p_data.get("primary_provider") in provs:
+                self.hybrid_primary_var.set(p_data["primary_provider"])
+            if p_data.get("secondary_provider") in provs:
+                self.hybrid_secondary_var.set(p_data["secondary_provider"])
+            self.log(f"Profile '{p_name}' is a hybrid profile: primary={p_data.get('primary_provider')}, secondary={p_data.get('secondary_provider')}")
 
         self.cfg["active_provider"] = p_name
         save_config(self.cfg)
@@ -640,21 +880,33 @@ class ClaudeBridgeApp:
             return
         if "providers" not in self.cfg:
             self.cfg["providers"] = {}
-        self.cfg["providers"][p_name] = {
+        # Preserve legacy in-profile hybrid fields (is_hybrid, primary/secondary
+        # provider, fallback_on_error) that this form doesn't edit; a blind
+        # overwrite would silently strip them and kill the routing setup.
+        merged = dict(self.cfg["providers"].get(p_name, {}))
+        merged.update({
             "router_url": self.url_var.get().strip(),
             "api_key": self.key_var.get().strip(),
             "model": self.model_var.get().strip(),
             "sonnet_model": self.sonnet_var.get().strip(),
             "opus_model": self.opus_var.get().strip(),
             "haiku_model": self.haiku_var.get().strip()
-        }
+        })
+        self.cfg["providers"][p_name] = merged
         self.cfg["active_provider"] = p_name
         self.cfg["port"] = self.port_var.get()
         self.cfg["minimize_to_tray"] = self.min_on_close_var.get()
         self.cfg["auto_start"] = self.auto_start_var.get()
+        self.cfg["boot_to_tray"] = self.boot_tray_var.get()
         self.cfg["thinking_mode"] = self._get_thinking_mode_key()
         self.cfg["context_length"] = self.get_context_length()
         self.cfg["auto_compact_window"] = self.auto_ctx_var.get()
+        self.cfg["strip_images"] = self.strip_images_var.get()
+        self.cfg["enable_hybrid_router"] = self.hybrid_var.get()
+        self.cfg["hybrid_primary_provider"] = self.hybrid_primary_var.get()
+        self.cfg["hybrid_secondary_provider"] = self.hybrid_secondary_var.get()
+        self.cfg["hybrid_fallback"] = self.hybrid_fallback_var.get()
+        self.cfg["multi_key_rotation"] = self.multi_key_var.get()
         save_config(self.cfg)
 
     def save_current_provider(self):
@@ -727,13 +979,145 @@ class ClaudeBridgeApp:
         else:
             self.key_entry.configure(show="•")
 
+    # --- Boot launch: HKCU Run key on Windows, LaunchAgent on macOS ---
+    RUN_KEY_NAME = "ClaudeBridge"
+    MACOS_PLIST_PATH = os.path.expanduser("~/Library/LaunchAgents/com.claudebridge.app.plist")
+
+    @classmethod
+    def _boot_launch_command(cls):
+        # Frozen exe: launch the binary directly. From source: use the
+        # current interpreter so it doesn't depend on file association.
+        if getattr(sys, "frozen", False):
+            target = f'"{sys.executable}"'
+        else:
+            target = f'"{sys.executable}" "{os.path.abspath(sys.argv[0])}"'
+        return target
+
+    @classmethod
+    def _run_key_path(cls):
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+            val, _ = winreg.QueryValueEx(k, cls.RUN_KEY_NAME)
+            return val
+
+    def _boot_launch_enabled(self):
+        """Whether our HKCU Run value / LaunchAgent plist exists."""
+        if sys.platform == "darwin":
+            return os.path.exists(self.MACOS_PLIST_PATH)
+        try:
+            self._run_key_path()
+            return True
+        except Exception:
+            return False
+
+    def _toggle_boot_launch(self):
+        try:
+            if self.launch_on_boot_var.get():
+                target = self._boot_launch_command()
+                if self.boot_tray_var.get():
+                    target += " --tray"
+                if sys.platform == "darwin":
+                    self._write_macos_plist(target)
+                    self.log(f"Will launch at macOS login: {target}")
+                else:
+                    self._write_windows_run_key(target)
+                    self.log(f"Will launch at Windows login: {target}")
+            else:
+                if sys.platform == "darwin":
+                    if os.path.exists(self.MACOS_PLIST_PATH):
+                        os.remove(self.MACOS_PLIST_PATH)
+                    self.log("Removed macOS login launch entry.")
+                else:
+                    self._delete_windows_run_key()
+                    self.log("Removed Windows login launch entry.")
+        except Exception as e:
+            self.log(f"Could not update startup entry: {e}")
+            messagebox.showerror("Startup Error", f"Could not update the startup entry:\n{e}")
+
+    def _write_macos_plist(self, target):
+        # ponytail: shlex.split of a quoted command string, macOS needs args as
+        # array elements — fine for our two shapes (exe / exe + script).
+        import shlex
+        args = shlex.split(target)
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.claudebridge.app</string>
+    <key>ProgramArguments</key>
+    <array>
+{''.join(f'        <string>{a}</string>\n' for a in args)}    </array>
+    <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+"""
+        os.makedirs(os.path.dirname(self.MACOS_PLIST_PATH), exist_ok=True)
+        with open(self.MACOS_PLIST_PATH, "w", encoding="utf-8") as f:
+            f.write(plist)
+
+    def _write_windows_run_key(self, target):
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, self.RUN_KEY_NAME, 0, winreg.REG_SZ, target)
+
+    def _delete_windows_run_key(self):
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                                winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, self.RUN_KEY_NAME)
+        except FileNotFoundError:
+            pass
+
+    def _persist_options(self, *_a):
+        """Persist every option checkbox/combobox the moment it changes.
+
+        The engine reads these live via get_current_config(), but without this
+        handler a toggle was lost on restart — the value only reached disk when
+        the user happened to click Save or quit cleanly.
+        """
+        self.cfg["minimize_to_tray"] = self.min_on_close_var.get()
+        self.cfg["auto_start"] = self.auto_start_var.get()
+        self.cfg["boot_to_tray"] = self.boot_tray_var.get()
+        self.cfg["enable_hybrid_router"] = self.hybrid_var.get()
+        self.cfg["hybrid_primary_provider"] = self.hybrid_primary_var.get()
+        self.cfg["hybrid_secondary_provider"] = self.hybrid_secondary_var.get()
+        self.cfg["hybrid_fallback"] = self.hybrid_fallback_var.get()
+        self.cfg["multi_key_rotation"] = self.multi_key_var.get()
+        self.cfg["strip_images"] = self.strip_images_var.get()
+        self.cfg["auto_compact_window"] = self.auto_ctx_var.get()
+        save_config(self.cfg)
+
+    def _sync_boot_launch_flag(self):
+        """The --tray flag lives inside the Run key's command, so flipping the
+        tray preference has to rewrite that entry for it to take effect."""
+        self._persist_options()
+        if self.launch_on_boot_var.get():
+            self._toggle_boot_launch()  # rewrites the key with the current flag
+
     def log(self, text):
         def _append():
             ts = datetime.now().strftime("%H:%M:%S")
+            lower = text.lower()
+            if "error" in lower or "failed" in lower or "failover" in lower or "rotating" in lower:
+                tag = "err"
+            elif "successfully" in lower or "started" in lower:
+                tag = "ok"
+            else:
+                tag = "info"
             self.log_area.configure(state="normal")
-            self.log_area.insert("end", f"[{ts}] {text}\n")
-            self.log_area.see("end")
+            self.log_area.insert("end", f"[{ts}] ", ("info",))
+            self.log_area.insert("end", f"{text}\n", (tag,))
+            if self.auto_scroll_var.get():
+                self.log_area.see("end")
             self.log_area.configure(state="disabled")
+            # The log is the status surface now: surface the newest line up top.
+            self.log_status_lbl.configure(
+                text=("⚠ " if tag == "err" else "") + text[:60]
+            )
         self.root.after(0, _append)
 
     def clear_log(self):
@@ -754,7 +1138,17 @@ class ClaudeBridgeApp:
             "auto_start": self.auto_start_var.get(),
             "thinking_mode": self._get_thinking_mode_key(),
             "context_length": self.get_context_length(),
-            "auto_compact_window": self.auto_ctx_var.get()
+            "auto_compact_window": self.auto_ctx_var.get(),
+            "strip_images": self.strip_images_var.get(),
+            # Hybrid routing: the engine reads `all_providers` to resolve the
+            # primary/secondary router configs by name. Without these keys it
+            # silently stays single-router and never fails over.
+            "all_providers": self.cfg.get("providers", {}),
+            "enable_hybrid_router": self.hybrid_var.get(),
+            "hybrid_primary_provider": self.hybrid_primary_var.get(),
+            "hybrid_secondary_provider": self.hybrid_secondary_var.get(),
+            "hybrid_fallback": self.hybrid_fallback_var.get(),
+            "multi_key_rotation": self.multi_key_var.get()
         }
 
     def toggle_proxy(self):
@@ -792,7 +1186,14 @@ class ClaudeBridgeApp:
             self.status_badge.configure(text=f"● RUNNING :{port}", bg="#10b981")
             self.start_btn.configure(text="⏹  STOP PROXY", bg="#ef4444", activebackground="#dc2626")
             self.log(f"Proxy successfully started on http://127.0.0.1:{port}")
-            self.log(f"Active Provider: [{p_name}] -> {cfg['router_url']}")
+            if cfg.get("enable_hybrid_router"):
+                self.log(
+                    f"Hybrid ON: Sonnet/Opus -> [{cfg.get('hybrid_primary_provider')}], "
+                    f"Haiku/Vision -> [{cfg.get('hybrid_secondary_provider')}]"
+                    + (", failover armed" if cfg.get("hybrid_fallback", True) else ", failover OFF")
+                )
+            else:
+                self.log(f"Active Provider: [{p_name}] -> {cfg['router_url']}")
             self.log(f"Mappings: Sonnet->{cfg['sonnet_model']}, Opus->{cfg['opus_model']}, Haiku->{cfg['haiku_model']}")
             self._update_tray_menu(is_running=True)
 
@@ -812,6 +1213,81 @@ class ClaudeBridgeApp:
         self.start_btn.configure(text="▶  START PROXY", bg="#10b981", activebackground="#059669")
         self.log("Proxy stopped.")
         self._update_tray_menu(is_running=False)
+
+    def configure_claude_settings(self):
+        r"""Points Claude Code's settings.json at the local proxy."""
+        cfg = self.get_current_config()
+        port = cfg["port"]
+        local_base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            os.makedirs(CLAUDE_DIR, exist_ok=True)
+            settings = {}
+            if os.path.exists(CLAUDE_SETTINGS_PATH):
+                # Make backup if not already present
+                if not os.path.exists(CLAUDE_BACKUP_PATH):
+                    shutil.copy2(CLAUDE_SETTINGS_PATH, CLAUDE_BACKUP_PATH)
+                    self.log(f"Created Claude settings backup at {CLAUDE_BACKUP_PATH}")
+                try:
+                    with open(CLAUDE_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                        settings = json.load(f)
+                except Exception:
+                    settings = {}
+
+            if "env" not in settings:
+                settings["env"] = {}
+
+            settings["env"]["ANTHROPIC_BASE_URL"] = local_base_url
+            settings["env"]["CLAUDE_CODE_USE_AUTH_TOKEN"] = "true"
+            settings["env"]["ANTHROPIC_AUTH_TOKEN"] = "claude-bridge-local-token"
+            settings["env"]["ANTHROPIC_MODEL"] = cfg["model"]
+            settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] = cfg["opus_model"]
+            settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = cfg["sonnet_model"]
+            settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = cfg["haiku_model"]
+
+            # Auto-compact: CLAUDE_CODE_MAX_CONTEXT_TOKENS is only honored when
+            # DISABLE_COMPACT is set, and it only raises the *ceiling* — Claude Code
+            # still won't trigger compaction on its own. The two keys that actually
+            # make it compact at this limit are autoCompactWindow (threshold) and
+            # CLAUDE_CODE_AUTO_COMPACT_WINDOW (same value as env override).
+            context_length = cfg["context_length"]
+            settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_length)
+            settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(context_length)
+            # This proxy rewrites Anthropic<->OpenAI traffic, which strips the
+            # safeguards request/response fields the auto-mode classifier needs,
+            # so Claude Code falls back to its own billed classifier requests.
+            # Asking for server checks here can never succeed.
+            settings["env"]["CLAUDE_CODE_AUTO_MODE_SERVER"] = "0"
+            settings["env"].pop("DISABLE_COMPACT", None)
+            if cfg.get("auto_compact_window", True):
+                settings["autoCompactWindow"] = context_length
+            else:
+                settings.pop("autoCompactWindow", None)
+
+            with open(CLAUDE_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2)
+
+            self.log(f"Updated Claude Code settings for provider [{self.provider_var.get()}].")
+            compact_note = (
+                f"Auto-compact at {context_length:,} tokens (matches this model's context window)."
+                if cfg.get("auto_compact_window", True) else
+                "Auto-compact disabled — Claude Code will use its own defaults."
+            )
+            messagebox.showinfo(
+                "Claude Code Configured",
+                f"Claude Code settings updated successfully!\n\n"
+                f"Active Provider: {self.provider_var.get()}\n"
+                f"Base URL: {local_base_url}\n"
+                f"Sonnet: {cfg['sonnet_model']}\n"
+                f"Opus: {cfg['opus_model']}\n"
+                f"Haiku: {cfg['haiku_model']}\n"
+                f"Custom: {cfg['model']}\n\n"
+                f"{compact_note}\n\n"
+                f"Claude Code is now connected through Claude Bridge!"
+            )
+        except Exception as e:
+            self.log(f"Failed to configure Claude Code settings: {e}")
+            messagebox.showerror("Error", f"Could not update Claude Code settings:\n{e}")
 
     def restore_claude_settings(self):
         """Restores original settings.json from backup."""
@@ -936,9 +1412,23 @@ class ClaudeBridgeApp:
 def main():
     import multiprocessing
     multiprocessing.freeze_support()
+
+    # Crucial on Windows: Explicitly register AppUserModelID so Windows Taskbar
+    # groups this process as Claude Bridge and renders our custom icon rather than the Python logo.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"anthropic.claudebridge.app.{APP_VERSION}")
+        except Exception:
+            pass
+
+    # --tray: launched at OS login with "start minimized in the tray".
+    start_in_tray = "--tray" in sys.argv[1:]
     try:
         root = tk.Tk()
         app = ClaudeBridgeApp(root)
+        if start_in_tray:
+            app.minimize_to_tray()
         root.mainloop()
     except Exception:
         import traceback
