@@ -311,6 +311,13 @@ def _stream_timeout():
 
 _NONSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
 
+# The hybrid fast lane (Haiku/vision routers) is for small cheap turns. A
+# compaction request carries the whole conversation as text; sending that to a
+# small fast model stalls it, which is the "stuck compacting" failure in hybrid
+# mode. Above this much *text*, a request takes the heavy lane regardless of
+# model hint. Image bytes don't count -- a screenshot turn is still a small task.
+FAST_LANE_MAX_TEXT_BYTES = 200_000
+
 # --- Token accounting ---------------------------------------------------------
 # ponytail: module-level counters read by the UI. ProxyRequestHandler instances
 # are created per request, so an instance field would reset every time.
@@ -715,6 +722,33 @@ def trim_openai_messages(messages, max_bytes=650000):
     return system_msgs + notice_msgs + flattened
 
 
+def _anthropic_text_bytes(anthropic_req):
+    """Size of a request's *text* content, base64 image payloads excluded.
+
+    See FAST_LANE_MAX_TEXT_BYTES for why this matters.
+    """
+    total = 0
+    for m in anthropic_req.get("messages") or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c.encode("utf-8"))
+        elif isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text":
+                    total += len((b.get("text") or "").encode("utf-8"))
+                elif b.get("type") == "tool_result":
+                    rc = b.get("content")
+                    if isinstance(rc, str):
+                        total += len(rc.encode("utf-8"))
+                    elif isinstance(rc, list):
+                        for sb in rc:
+                            if isinstance(sb, dict) and sb.get("type") == "text":
+                                total += len((sb.get("text") or "").encode("utf-8"))
+    return total
+
+
 class ProxyRequestHandler(BaseHTTPRequestHandler):
     # HTTP/1.1 so Claude Code can keep-alive one connection to the proxy
     # instead of opening a fresh socket per request.
@@ -736,15 +770,31 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if self.log_callback:
             self.log_callback(text)
 
-    def _close_sse_stream(self, reason=""):
-        """Best-effort terminal SSE event for a stream that already sent its 200
-        headers and then died mid-response. Without this Claude Code keeps the
-        turn open waiting for message_stop, which is the "chat goes dead until
-        nudged" symptom.
+    def _close_sse_stream(self, reason="", input_tokens=0, output_tokens=0):
+        """Best-effort terminal SSE sequence for a stream that already sent its
+        200 headers and then died mid-response. Without this Claude Code keeps
+        the turn open waiting for message_stop, which is the "chat goes dead
+        until nudged" symptom.
+
+        The message_delta matters as much as the stop: Claude Code finalizes the
+        turn on its stop_reason, and its autocompact counter reads usage from
+        this block. A bare message_stop left the counter unsettled, so a turn
+        that died during compaction could re-fire compaction on itself.
         """
         if reason:
             self.emit_log(reason)
         try:
+            delta = {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {
+                    "input_tokens": int(input_tokens or 0),
+                    "output_tokens": int(output_tokens or 0),
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            }
+            self.wfile.write(f"event: message_delta\ndata: {json.dumps(delta)}\n\n".encode("utf-8"))
             self.wfile.write(b'event: message_stop\ndata: {"type": "message_stop"}\n\n')
             self.wfile.flush()
         except Exception:
@@ -863,6 +913,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         def _execute_streaming(req_dict):
             nonlocal client, current_key
+            # Visible to the except clauses below even if the upstream dies
+            # before the streaming loop starts.
+            stream_in = 0
+            stream_out = 0
             try:
                 with client.messages.with_streaming_response.create(
                         **req_dict, stream=True, timeout=STREAM_IDLE_TIMEOUT) as resp:
@@ -907,7 +961,22 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     saw_stop = False
                     stream_in = 0
                     stream_out = 0
+                    # The read timeout bounds the gap between socket reads, but
+                    # an upstream can hold the socket open on SSE comment lines
+                    # (": keep-alive") while delivering nothing, and then the
+                    # client waits forever. Every data: line resets this; only a
+                    # run of comments (or silence) trips it.
+                    last_progress = time.monotonic()
                     for line in resp.iter_lines():
+                        if line.startswith(":"):
+                            if time.monotonic() - last_progress > STREAM_IDLE_TIMEOUT:
+                                self.emit_log(
+                                    f"Upstream sent only SSE keep-alives for "
+                                    f"{int(STREAM_IDLE_TIMEOUT)}s; abandoning stalled stream.")
+                                break
+                            continue
+                        if line.startswith("data:"):
+                            last_progress = time.monotonic()
                         if line.startswith("event: billing_summary"):
                             is_filtering_billing = True
                             continue
@@ -965,7 +1034,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         # on a stream that will never emit message_stop.
                         self._close_sse_stream(
                             "Upstream stream ended without message_stop; "
-                            "closing turn so Claude Code can continue.")
+                            "closing turn so Claude Code can continue.",
+                            stream_in, stream_out)
                     self.emit_log("Response successfully streamed to Claude.")
 
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -1020,7 +1090,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 if stream_started:
                     self._close_sse_stream(
                         f"Upstream stream failed mid-response (HTTP {status}: {err_body[:200]}); "
-                        f"closing turn so Claude Code can continue.")
+                        f"closing turn so Claude Code can continue.",
+                        stream_in, stream_out)
                     return
                 self.emit_log(f"Router Error ({status}): {err_body}")
                 try:
@@ -1033,11 +1104,41 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     self.wfile.write(body_bytes)
                 except Exception:
                     pass
+            except anthropic.APIConnectionError as ex:
+                # Timeout or dead socket before the response started: the
+                # failover chain exists for exactly this. Without it a hung
+                # primary router raises here, the generic handler below 500s,
+                # and Claude Code re-sends the same request to the same dead
+                # router -- the "stuck compacting" loop in hybrid mode.
+                if stream_started:
+                    self._close_sse_stream(
+                        f"Upstream stream failed mid-response ({type(ex).__name__}: {ex}); "
+                        f"closing turn so Claude Code can continue.",
+                        stream_in, stream_out,
+                    )
+                    return
+                if allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
+                    self.emit_log(
+                        f"Router unreachable ({type(ex).__name__}: {ex}); "
+                        f"failing over to [{fallback_name}]...")
+                    return self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
+                self.emit_log(f"Proxy Connection Error: {str(ex)}")
+                try:
+                    payload = json.dumps({"error": str(ex)}).encode("utf-8")
+                    self.send_response(504)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(payload)
+                except Exception:
+                    pass
             except Exception as ex:
                 if stream_started:
                     self._close_sse_stream(
                         f"Upstream stream failed mid-response ({type(ex).__name__}: {ex}); "
-                        f"closing turn so Claude Code can continue."
+                        f"closing turn so Claude Code can continue.",
+                        stream_in, stream_out,
                     )
                     return
                 self.emit_log(f"Proxy Connection Error: {str(ex)}")
@@ -1124,6 +1225,22 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(body_bytes)
+            except anthropic.APIConnectionError as ex:
+                # Same rationale as the streaming path: a hung primary must
+                # advance the chain, not 500 and get retried against itself.
+                if allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
+                    self.emit_log(
+                        f"Router unreachable ({type(ex).__name__}: {ex}); "
+                        f"failing over to [{fallback_name}]...")
+                    return self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
+                self.emit_log(f"Proxy Connection Error: {str(ex)}")
+                payload = json.dumps({"error": str(ex)}).encode("utf-8")
+                self.send_response(504)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(payload)
             except Exception as ex:
                 self.emit_log(f"Proxy Connection Error: {str(ex)}")
                 payload = json.dumps({"error": str(ex)}).encode("utf-8")
@@ -1216,6 +1333,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         # lane split already happened on the first entry.
         is_redispatch = bool((tb or {}).get("used_fallback"))
         fast_lane = (has_images or is_haiku) and not is_redispatch and len(chain_names) >= 2
+        if fast_lane and _anthropic_text_bytes(anthropic_req) >= FAST_LANE_MAX_TEXT_BYTES:
+            self.emit_log(
+                f"Hybrid Route: large context (>= {FAST_LANE_MAX_TEXT_BYTES:,} text bytes) "
+                f"demoted off the fast lane -> heavy router."
+            )
+            fast_lane = False
         start = 1 if fast_lane else 0
         ordered = chain_names[start:] + chain_names[:start]
 
@@ -1369,6 +1492,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         stream_started = False
         last_retry_err = ""
+        # Accumulated usage, visible to the except clauses below even when the
+        # upstream dies before the streaming loop assigns them.
+        stream_in = 0
+        stream_out = 0
         try:
             client = _get_client()
             if is_stream:
@@ -1518,10 +1645,21 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     stream_in = 0
                     stream_out = 0
 
+                    # Same stall guard as the anthropic-native path: an upstream
+                    # can keep the socket warm with SSE comment lines (": ping")
+                    # and deliver nothing. data: lines reset the clock.
+                    last_progress = time.monotonic()
                     for line in resp.iter_lines():
                         line = line.strip()
-                        if not line or not line.startswith("data:"):
+                        if not line.startswith("data:"):
+                            if line and time.monotonic() - last_progress > STREAM_IDLE_TIMEOUT:
+                                self.emit_log(
+                                    f"Upstream produced no SSE data for "
+                                    f"{int(STREAM_IDLE_TIMEOUT)}s (keep-alive only); "
+                                    f"closing the stalled turn.")
+                                break
                             continue
+                        last_progress = time.monotonic()
                         data_str = line[5:].strip()
                         if data_str == "[DONE]":
                             break
@@ -1951,6 +2089,36 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             return
+        except httpx.TransportError as ex:
+            # Connect/read timeout or a dead socket. Before the response
+            # started this is exactly what the failover chain is for: without
+            # it a hung primary router 500s and Claude Code re-sends the same
+            # request to the same dead router -- the "stuck compacting" loop
+            # in hybrid mode.
+            if stream_started:
+                self._close_sse_stream(
+                    f"Upstream stream failed mid-response ({type(ex).__name__}: {ex}); "
+                    f"closing turn so Claude Code can continue.",
+                    stream_in, stream_out,
+                )
+                return
+            if allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
+                self.emit_log(
+                    f"Router unreachable ({type(ex).__name__}: {ex}); "
+                    f"failing over to [{fallback_name}]...")
+                self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
+                return
+            self.emit_log(f"Proxy Connection Error: {str(ex)}")
+            try:
+                payload = json.dumps({"error": str(ex)}).encode("utf-8")
+                self.send_response(504)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception:
+                pass
         except Exception as ex:
             # If the 200 + message_start already went out, a 500 is no longer a
             # valid HTTP response: close the SSE turn so Claude Code resumes
@@ -1958,7 +2126,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             if stream_started:
                 self._close_sse_stream(
                     f"Upstream stream failed mid-response ({type(ex).__name__}: {ex}); "
-                    f"closing turn so Claude Code can continue."
+                    f"closing turn so Claude Code can continue.",
+                    stream_in, stream_out,
                 )
                 return
             self.emit_log(f"Proxy Connection Error: {str(ex)}")
