@@ -301,6 +301,16 @@ def _close_client():
 # sending chunks and is unaffected.
 STREAM_IDLE_TIMEOUT = 240.0
 
+# ponytail: `read` bounds the idle gap between chunks, not total generation
+# time, so a healthy long response is unaffected -- a dead upstream releases
+# the turn in STREAM_IDLE_TIMEOUT instead of the 600s default. Built per call
+# (not a constant) so tests can retune STREAM_IDLE_TIMEOUT at runtime.
+def _stream_timeout():
+    return httpx.Timeout(connect=10.0, read=STREAM_IDLE_TIMEOUT, write=60.0, pool=10.0)
+
+
+_NONSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
+
 # --- Token accounting ---------------------------------------------------------
 # ponytail: module-level counters read by the UI. ProxyRequestHandler instances
 # are created per request, so an instance field would reset every time.
@@ -374,45 +384,57 @@ def fetch_context_length(router_url, api_key, model, timeout=8.0):
     Never raises: returns DEFAULT_CONTEXT_LENGTH when the value is unknown, so
     callers always have a number to write into Claude Code settings.
     """
-    cache_key = (router_url, model)
+    # The cache holds the whole model->length table per router, not one entry
+    # per (router, model): routers that report nothing send every listed model
+    # its own serial /models round-trip otherwise, and /v1/models lists ~6.
+    wanted = (model or "").strip().lower()
     with _context_cache_lock:
-        if cache_key in _context_cache:
-            return _context_cache[cache_key]
+        table = _context_cache.get(router_url)
+        if table is not None and wanted in table:
+            return table[wanted]
 
     resolved = _lookup_known_context(model)
     if resolved is None:
         # Ask the router. Most return no context_length; 401/404/timeout just
-        # fall through to the default.
+        # fall through to the default. The whole model table is fetched once
+        # per router: after that, unknown models resolve to the default from
+        # the cache instead of each paying their own round-trip.
         try:
-            base = router_url.rstrip("/")
-            if not base.endswith("/models"):
-                base = f"{base}/models"
-            if not base.endswith("/models"):
-                base = f"{base}/models"
-            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-            with httpx.Client(timeout=timeout) as probe:
-                resp = probe.get(base, headers=headers)
-            if resp.status_code == 200:
-                payload = resp.json()
-                items = payload.get("data") or payload.get("models") or []
-                wanted = (model or "").strip().lower()
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("id", "").strip().lower() != wanted:
-                        continue
-                    length = item.get("context_length") or item.get("max_context_length")
-                    if isinstance(length, int) and length > 0:
-                        resolved = length
-                    break
+            with _context_cache_lock:
+                already_probed = _context_cache.get(router_url, {}).get("__probed__", False)
+            if not already_probed:
+                base = router_url.rstrip("/")
+                if not base.endswith("/models"):
+                    base = f"{base}/models"
+                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                resp = _get_client().get(base, headers=headers, timeout=timeout)
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    items = payload.get("data") or payload.get("models") or []
+                    fetched = {"__probed__": True}
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        length = item.get("context_length") or item.get("max_context_length")
+                        if isinstance(length, int) and length > 0:
+                            fetched[(item.get("id") or "").strip().lower()] = length
+                    with _context_cache_lock:
+                        _context_cache.setdefault(router_url, {}).update(fetched)
+                else:
+                    with _context_cache_lock:
+                        _context_cache.setdefault(router_url, {})["__probed__"] = True
         except Exception:
             resolved = None
+            # Router unreachable: remember the probe failed so /v1/models
+            # doesn't retry it for every listed model this process lifetime.
+            with _context_cache_lock:
+                _context_cache.setdefault(router_url, {})["__probed__"] = True
 
     if not resolved:
         resolved = DEFAULT_CONTEXT_LENGTH
 
     with _context_cache_lock:
-        _context_cache[cache_key] = resolved
+        _context_cache.setdefault(router_url, {})[wanted] = resolved
     return resolved
 
 
@@ -701,6 +723,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     config_getter = None  # Function returning dict: {"router_url", "api_key", "model"}
     log_callback = None   # Function(msg: str)
 
+    # Ordered failover tail for the request being handled: [(name, cfg), ...]
+    # after the active router. Per-request because one handler instance is
+    # built per request.
+    _failover_chain = None
+
     def log_message(self, format, *args):
         # Override to prevent default stderr logging
         pass
@@ -807,6 +834,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         tried_keys = set()  # keys already attempted for this request (429 failover)
         client = _get_anthropic_client(current_key, base_url)
         is_stream = anthropic_req.get("stream", True)
+        # True once the 200 + SSE headers went out. An exception after that
+        # point cannot send a fresh HTTP status, so the turn must be closed
+        # with a terminal SSE event instead or Claude Code waits forever.
+        stream_started = False
         thinking_mode = cfg.get("thinking_mode", "thinking_block")
 
         max_toks = anthropic_req.get("max_tokens", 4096)
@@ -833,7 +864,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         def _execute_streaming(req_dict):
             nonlocal client, current_key
             try:
-                with client.messages.with_streaming_response.create(**req_dict, stream=True) as resp:
+                with client.messages.with_streaming_response.create(
+                        **req_dict, stream=True, timeout=STREAM_IDLE_TIMEOUT) as resp:
                     # 1. Multi-key failover retry on 429/402
                     if resp.status_code in (429, 402) and multi_key_enabled:
                         tried_keys.add(current_key)
@@ -868,9 +900,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     self.close_connection = True
+                    stream_started = True
 
                     is_filtering_billing = False
                     ignoring_thinking = False
+                    saw_stop = False
                     stream_in = 0
                     stream_out = 0
                     for line in resp.iter_lines():
@@ -920,9 +954,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         try:
                             self.wfile.write((line + "\n").encode("utf-8"))
                             self.wfile.flush()
+                            if line.startswith("event: message_stop"):
+                                saw_stop = True
                         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                             break
                     add_tokens(stream_in, stream_out)
+                    if not saw_stop:
+                        # Upstream ended (clean close or truncation) without a
+                        # terminal event: close the turn or Claude Code waits
+                        # on a stream that will never emit message_stop.
+                        self._close_sse_stream(
+                            "Upstream stream ended without message_stop; "
+                            "closing turn so Claude Code can continue.")
                     self.emit_log("Response successfully streamed to Claude.")
 
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -974,6 +1017,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     self.emit_log(f"Anthropic Router Error ({status}): Failing over to fallback router [{fallback_name}]...")
                     return self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
 
+                if stream_started:
+                    self._close_sse_stream(
+                        f"Upstream stream failed mid-response (HTTP {status}: {err_body[:200]}); "
+                        f"closing turn so Claude Code can continue.")
+                    return
                 self.emit_log(f"Router Error ({status}): {err_body}")
                 try:
                     self.send_response(status)
@@ -986,6 +1034,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             except Exception as ex:
+                if stream_started:
+                    self._close_sse_stream(
+                        f"Upstream stream failed mid-response ({type(ex).__name__}: {ex}); "
+                        f"closing turn so Claude Code can continue."
+                    )
+                    return
                 self.emit_log(f"Proxy Connection Error: {str(ex)}")
                 try:
                     payload = json.dumps({"error": str(ex)}).encode("utf-8")
@@ -1001,7 +1055,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         def _execute_non_streaming(req_dict):
             nonlocal client, current_key
             try:
-                resp = client.messages.create(**req_dict, stream=False)
+                resp = client.messages.create(**req_dict, stream=False, timeout=300.0)
                 payload = resp.model_dump_json().encode("utf-8")
                 # resp.usage is validated SDK output, so it is trusted-shape here.
                 usage = getattr(resp, "usage", None)
@@ -1086,22 +1140,36 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             _execute_non_streaming(clean_req)
 
 
-    def _route_request(self, anthropic_req, cfg):
+    def _route_request(self, anthropic_req, cfg, tb=None):
         """Resolve active + fallback provider configs for this request.
 
         cfg carries the flat fields the GUI always writes (router_url, api_key,
         models) plus the hybrid options (enable_hybrid_router, all_providers,
-        hybrid_primary_provider, hybrid_secondary_provider, hybrid_fallback).
+        hybrid_chain, hybrid_fallback).
 
-        Fast/haiku and vision tasks go to the secondary (fast) router; heavy
-        sonnet/opus tasks go to the primary. Returns (active_cfg, fallback_cfg,
-        fallback_name, allow_fallback).
+        The chain is an ordered list of provider names. Heavy Sonnet/Opus tasks
+        start at chain[0]; fast Haiku/vision tasks start at chain[1] when the
+        chain has 2+ entries. Whatever sits after the chosen router, in chain
+        order, is the failover tail (recorded on the handler so _failover_request
+        can walk it hop by hop instead of the old single secondary router).
+
+        On a failover re-dispatch tb marks this request as already handed off, so
+        the lane split is not re-applied: the remaining chain is walked in order.
         """
-        router_url = (cfg.get("router_url") or "").lower()
         all_providers = cfg.get("all_providers", {}) or {}
-        primary_name = cfg.get("hybrid_primary_provider") or cfg.get("primary_provider") or ""
-        secondary_name = cfg.get("hybrid_secondary_provider") or cfg.get("secondary_provider") or ""
-        is_hybrid = bool(cfg.get("enable_hybrid_router") or cfg.get("is_hybrid")) and primary_name and secondary_name
+
+        chain_raw = cfg.get("hybrid_chain")
+        if isinstance(chain_raw, list):
+            # An explicit empty list means "no chain" (single router, no failover).
+            chain_names = [str(n).strip() for n in chain_raw if str(n).strip()]
+        else:
+            # Legacy 2-router config: primary then secondary.
+            p = cfg.get("hybrid_primary_provider") or cfg.get("primary_provider") or ""
+            s = cfg.get("hybrid_secondary_provider") or cfg.get("secondary_provider") or ""
+            chain_names = [p] + ([s] if s else [])
+        chain_names = [n for n in chain_names if n in all_providers]
+
+        is_hybrid = bool(cfg.get("enable_hybrid_router") or cfg.get("is_hybrid")) and chain_names
 
         req_model = (anthropic_req.get("model") or "").lower()
         is_haiku = "haiku" in req_model
@@ -1125,40 +1193,86 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 break
 
         if not is_hybrid:
+            self._failover_chain = []
             return dict(cfg), None, "", False
 
-        primary_cfg = dict(all_providers.get(primary_name) or {})
-        secondary_cfg = dict(all_providers.get(secondary_name) or {})
-        # If a named provider is missing, fall back to the flat fields.
-        if not primary_cfg.get("router_url"):
-            primary_cfg = dict(cfg)
-        for k in ("thinking_mode", "auto_save_images", "strip_images", "multi_key_rotation"):
-            if k in cfg:
-                primary_cfg[k] = cfg[k]
-                secondary_cfg[k] = cfg[k]
+        def _cfg_for(name):
+            c = dict(all_providers.get(name) or {})
+            if not c.get("router_url"):
+                return None
+            for k in ("thinking_mode", "auto_save_images", "strip_images", "multi_key_rotation"):
+                if k in cfg:
+                    c[k] = cfg[k]
+            return c
 
-        allow_fallback = bool(cfg.get("hybrid_fallback", True))
-        if not secondary_cfg.get("router_url"):
-            return primary_cfg, None, "", allow_fallback
+        active_cfg = _cfg_for(chain_names[0])
+        if active_cfg is None:
+            # First chain entry is unusable (no URL); the flat fields are the
+            # last resort rather than erroring out.
+            self._failover_chain = []
+            return dict(cfg), None, "", False
 
-        if has_images or is_haiku:
+        # A failover re-dispatch carries its own remaining tail; the fast/heavy
+        # lane split already happened on the first entry.
+        is_redispatch = bool((tb or {}).get("used_fallback"))
+        fast_lane = (has_images or is_haiku) and not is_redispatch and len(chain_names) >= 2
+        start = 1 if fast_lane else 0
+        ordered = chain_names[start:] + chain_names[:start]
+
+        active_name = ordered[0]
+        active_cfg = _cfg_for(active_name) or active_cfg
+
+        # Everything after the active router is the failover tail, walked in
+        # order on each upstream error. Per-request state on the handler
+        # (one ProxyRequestHandler per request) keeps it off other requests.
+        tail = [(n, c) for n in ordered[1:] if (c := _cfg_for(n))]
+        self._failover_chain = tail
+
+        allow_fallback = bool(cfg.get("hybrid_fallback", True)) and bool(tail)
+        if not tail:
+            return active_cfg, None, "", allow_fallback
+
+        next_name, next_cfg = tail[0]
+        if fast_lane:
             self.emit_log(
-                f"Hybrid Route: {'Vision Task (Image attached)' if has_images else 'Fast Task (Haiku)'} -> [{secondary_name}]"
+                f"Hybrid Route: {'Vision Task (Image attached)' if has_images else 'Fast Task (Haiku)'} "
+                f"-> [{active_name}] (failover: {' -> '.join(n for n, _ in tail)})"
             )
-            return secondary_cfg, primary_cfg, primary_name, allow_fallback
-        self.emit_log(f"Hybrid Route: Heavy Task (Sonnet/Opus) -> [{primary_name}]")
-        return primary_cfg, secondary_cfg, secondary_name, allow_fallback
+        else:
+            self.emit_log(
+                f"Hybrid Route: Heavy Task (Sonnet/Opus) -> [{active_name}] "
+                f"(failover: {' -> '.join(n for n, _ in tail)})"
+            )
+        return active_cfg, next_cfg, next_name, allow_fallback
 
     def _failover_request(self, anthropic_req, fallback_cfg, tb=None, fallback_name=""):
-        """Re-dispatch a request to the fallback router after an upstream error.
+        """Re-dispatch a request to the next router in the failover chain.
 
-        Recursion guard via tb.get('used_fallback'): the fallback router never
-        fails over again, so a broken router cannot cause a loop.
+        The hop being dispatched now is `fallback_cfg`; the rest of the chain
+        (set by _route_request on this request) is passed along as the
+        re-dispatch's own hybrid_chain, so the next upstream error advances to
+        the following hop. The chain strictly shrinks each hop, so a broken
+        router cannot cause a loop.
         """
         fb_name = fallback_name or fallback_cfg.get("_name") or "fallback"
-        self.emit_log(f"Failing over to fallback router [{fb_name}]...")
+        self.emit_log(f"Failing over to router [{fb_name}]...")
+        tail = getattr(self, "_failover_chain", None) or []
+        # The hop being dispatched now heads the re-dispatch's own chain; what
+        # sat after it arms its failover. The chain strictly shrinks each hop,
+        # so a broken router cannot cause a loop.
+        rest = [(n, c) for n, c in tail[1:] if c and c.get("router_url")]
         try:
-            return self._handle_messages(anthropic_req, fallback_cfg, tb={
+            # Rebuild the provider table around the remaining hops so the
+            # re-dispatch walks them in order instead of re-running the
+            # fast/heavy lane split on the tail.
+            redispatch_cfg = dict(fallback_cfg)
+            redispatch_cfg.update({
+                "enable_hybrid_router": True,
+                "hybrid_fallback": True,
+                "hybrid_chain": [fb_name] + [n for n, _ in rest],
+                "all_providers": {fb_name: fallback_cfg, **{n: c for n, c in rest}},
+            })
+            return self._handle_messages(anthropic_req, redispatch_cfg, tb={
                 **(tb or {}), "used_fallback": True, "fallback_to": fb_name
             })
         except Exception:
@@ -1178,12 +1292,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def _handle_messages(self, anthropic_req, cfg, tb=None):
         """Full message dispatch. cfg is the resolved provider config."""
         tb = tb or {}
-        active_cfg, fallback_cfg, fallback_name, allow_fallback = self._route_request(anthropic_req, cfg)
-        if tb.get("used_fallback"):
-            # One failover hop only. Without this, a fallback provider that is
-            # itself a hybrid profile could ping-pong A -> B -> A forever.
-            allow_fallback = False
-            fallback_cfg = None
+        active_cfg, fallback_cfg, fallback_name, allow_fallback = self._route_request(anthropic_req, cfg, tb)
 
         req_model = (anthropic_req.get("model") or "").lower()
         router_url = active_cfg.get("router_url", "https://inference.dahl.global/v1").rstrip("/")
@@ -1212,7 +1321,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         is_anthropic_native = ("agentrouter" in router_url.lower()) or ("anthropic.com" in router_url.lower()) or (active_cfg.get("protocol") == "anthropic")
         if is_anthropic_native:
             self._handle_anthropic_native(anthropic_req, target_model, router_url, api_key, active_cfg,
-                                          allow_fallback=allow_fallback, fallback_cfg=fallback_cfg, fallback_name=fallback_name)
+                                          allow_fallback=allow_fallback, fallback_cfg=fallback_cfg,
+                                          fallback_name=fallback_name, tb=tb)
             return
 
         # Build target OpenAI endpoint
@@ -1264,8 +1374,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             if is_stream:
                 # Stream response
                 with client.stream("POST", endpoint, headers=req_headers, json=openai_req,
-                                  timeout=httpx.Timeout(connect=10.0, read=STREAM_IDLE_TIMEOUT,
-                                                       write=60.0, pool=10.0)) as resp:
+                                  timeout=_stream_timeout()) as resp:
                     # 1. Multi-key failover retry on 429/402
                     if resp.status_code in (429, 402) and multi_key_enabled and len(api_keys) > 1:
                         for alt_key in [k for k in api_keys if k != current_key]:
@@ -1278,7 +1387,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                 resp.close()
                             except Exception:
                                 pass
-                            retry_ctx = client.stream("POST", endpoint, headers=alt_headers, json=openai_req)
+                            retry_ctx = client.stream("POST", endpoint, headers=alt_headers, json=openai_req, timeout=_stream_timeout())
                             retry_resp = retry_ctx.__enter__()
                             if retry_resp.status_code == 200:
                                 resp = retry_resp
@@ -1323,7 +1432,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                 resp.close()
                             except Exception:
                                 pass
-                            retry_ctx = client.stream("POST", endpoint, headers=req_headers, json=openai_req)
+                            retry_ctx = client.stream("POST", endpoint, headers=req_headers, json=openai_req, timeout=_stream_timeout())
                             retry_resp = retry_ctx.__enter__()
                             if retry_resp.status_code == 200:
                                 resp = retry_resp
@@ -1343,7 +1452,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                 resp.close()
                             except Exception:
                                 pass
-                            retry_ctx = client.stream("POST", endpoint, headers=req_headers, json=openai_req)
+                            retry_ctx = client.stream("POST", endpoint, headers=req_headers, json=openai_req, timeout=_stream_timeout())
                             retry_resp = retry_ctx.__enter__()
                             if retry_resp.status_code == 200:
                                 resp = retry_resp
@@ -1717,7 +1826,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
             else:
                 # Non-streaming
-                resp = client.post(endpoint, headers=req_headers, json=openai_req)
+                resp = client.post(endpoint, headers=req_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
                 # 1. Multi-key failover retry on 429/402
                 if resp.status_code in (429, 402) and multi_key_enabled and len(api_keys) > 1:
                     for alt_key in [k for k in api_keys if k != current_key]:
@@ -1726,7 +1835,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         self.emit_log(f"API key {old_m} hit limit ({resp.status_code}). Rotating to {new_m}...")
                         alt_headers = dict(req_headers)
                         alt_headers["Authorization"] = f"Bearer {alt_key}"
-                        retry_resp = client.post(endpoint, headers=alt_headers, json=openai_req)
+                        retry_resp = client.post(endpoint, headers=alt_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
                         if retry_resp.status_code == 200:
                             resp = retry_resp
                             break
@@ -1744,11 +1853,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         mark_router_rejects_inline_images(router_url)
                         self.emit_log(f"Router rejected inline images ({resp.status_code}). Retrying with images as file paths; future requests will skip inline images for this router.")
                         openai_req = strip_inline_images(openai_req)
-                        resp = client.post(endpoint, headers=req_headers, json=openai_req)
+                        resp = client.post(endpoint, headers=req_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
                     elif is_size_err and len(openai_req.get("messages", [])) > 2:
                         self.emit_log(f"Router rejected non-streaming payload ({resp.status_code}): TokenPlan limit reached. Rescuing with compacted context...")
                         openai_req["messages"] = trim_openai_messages(openai_req["messages"], max_bytes=450_000)
-                        resp = client.post(endpoint, headers=req_headers, json=openai_req)
+                        resp = client.post(endpoint, headers=req_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
 
                 if resp.status_code != 200:
                     if allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):

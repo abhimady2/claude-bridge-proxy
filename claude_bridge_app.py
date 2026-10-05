@@ -105,9 +105,11 @@ def get_default_config():
         # True = replace attached images with a disk path (routers that reject
         # inline image data or cap the request body, e.g. Atria TokenPlan).
         "strip_images": False,
-        # Hybrid routing between two provider profiles. Off by default: enabling
-        # it sends Haiku/vision to the secondary and Sonnet/Opus to the primary.
+        # Hybrid routing between provider profiles. Off by default: enabling it
+        # sends Haiku/vision to the second router in the chain and Sonnet/Opus
+        # to the first; the rest of the chain is the failover order.
         "enable_hybrid_router": False,
+        "hybrid_chain": [],
         "hybrid_primary_provider": "",
         "hybrid_secondary_provider": "",
         "hybrid_fallback": True,
@@ -128,13 +130,26 @@ def load_config():
                     defaults["active_provider"] = data["active_provider"]
                 for k in ("port", "minimize_to_tray", "auto_start", "thinking_mode",
                           "context_length", "auto_compact_window", "strip_images",
-                          "enable_hybrid_router", "hybrid_primary_provider",
-                          "hybrid_secondary_provider", "hybrid_fallback",
-                          "multi_key_rotation", "boot_to_tray"):
+                          "enable_hybrid_router", "hybrid_chain",
+                          "hybrid_primary_provider", "hybrid_secondary_provider",
+                          "hybrid_fallback", "multi_key_rotation", "boot_to_tray"):
                     if k in data:
                         defaults[k] = data[k]
         except Exception:
             pass
+    # Migrate the old primary/secondary pair into the ordered chain. Runs once:
+    # after this the chain is the source of truth.
+    if not defaults.get("hybrid_chain"):
+        legacy = []
+        p = defaults.get("hybrid_primary_provider")
+        s = defaults.get("hybrid_secondary_provider")
+        provs = defaults.get("providers", {})
+        if p in provs:
+            legacy.append(p)
+        if s in provs and s not in legacy:
+            legacy.append(s)
+        if legacy:
+            defaults["hybrid_chain"] = legacy
     return defaults
 
 
@@ -530,6 +545,7 @@ class ClaudeBridgeApp:
         # --- Hybrid Multi-Router ---
         hybrid_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
         hybrid_frame.pack(fill="x", pady=(0, 8))
+        self._hybrid_frame = hybrid_frame
 
         h_head = tk.Frame(hybrid_frame, bg="#1e1e24")
         h_head.pack(fill="x")
@@ -541,28 +557,31 @@ class ClaudeBridgeApp:
             activebackground="#1e1e24", selectcolor="#18181b", relief="flat", font=("Segoe UI", 8)
         ).pack(side="left", padx=(10, 0))
 
-        prov_names = list(self.cfg.get("providers", {}).keys())
+        # Ordered router chain. Heavy tasks start at router 1, fast (Haiku/vision)
+        # tasks at router 2 when the chain has 2+ entries; every router after the
+        # active one is a failover target, in list order.
+        self._chain_vars = []
+        self._chain_rows = []
+        self.chain_add_var = tk.StringVar()
 
-        def _default_prov(idx, fallback_key):
-            saved = self.cfg.get(fallback_key)
-            if saved in prov_names:
-                return saved
-            if prov_names:
-                return prov_names[min(idx, len(prov_names) - 1)]
-            return ""
+        add_row = tk.Frame(hybrid_frame, bg="#1e1e24")
+        add_row.pack(fill="x", pady=(4, 0))
+        self.chain_add_combo = ttk.Combobox(add_row, textvariable=self.chain_add_var, state="readonly", width=16, font=("Segoe UI", 8))
+        self.chain_add_combo.pack(side="left")
+        tk.Button(
+            add_row, text="➕ Add to chain", command=self._add_chain_provider,
+            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", activebackground="#52525b", activeforeground="#ffffff",
+            relief="flat", padx=6, pady=1, cursor="hand2"
+        ).pack(side="left", padx=(4, 0))
 
-        h_row2 = tk.Frame(hybrid_frame, bg="#1e1e24")
-        h_row2.pack(fill="x", pady=(4, 0))
-        tk.Label(h_row2, text="Primary:", width=8, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
-        self.hybrid_primary_var = tk.StringVar(value=_default_prov(0, "hybrid_primary_provider"))
-        ttk.Combobox(h_row2, textvariable=self.hybrid_primary_var, values=prov_names, state="readonly", width=16, font=("Segoe UI", 8)).pack(side="left", padx=(0, 10))
-        tk.Label(h_row2, text="Secondary:", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
-        self.hybrid_secondary_var = tk.StringVar(value=_default_prov(1, "hybrid_secondary_provider"))
-        # ttk widgets have no command=; the selection event is the persistence hook.
-        for _cb in h_row2.winfo_children():
-            if isinstance(_cb, ttk.Combobox):
-                _cb.bind("<<ComboboxSelected>>", lambda _e: self._persist_options())
-        ttk.Combobox(h_row2, textvariable=self.hybrid_secondary_var, values=prov_names, state="readonly", width=16, font=("Segoe UI", 8)).pack(side="left")
+        # Live summary of what the chain means for this request's routing.
+        self.chain_summary_lbl = tk.Label(hybrid_frame, text="", font=("Segoe UI", 8), bg="#1e1e24", fg="#71717a", anchor="w", justify="left", wraplength=260)
+        self.chain_summary_lbl.pack(fill="x", pady=(4, 0))
+
+        # Rows go last: _rebuild_chain_ui writes the Add picker and the summary.
+        self.chain_rows_frame = tk.Frame(hybrid_frame, bg="#1e1e24")
+        self.chain_rows_frame.pack(fill="x", pady=(4, 0))
+        self._rebuild_chain_ui()
 
         h_opts = tk.Frame(hybrid_frame, bg="#1e1e24")
         h_opts.pack(fill="x", pady=(4, 0))
@@ -802,11 +821,15 @@ class ClaudeBridgeApp:
         if p_data.get("is_hybrid"):
             self.hybrid_var.set(True)
             provs = list(self.cfg.get("providers", {}).keys())
+            legacy_chain = []
             if p_data.get("primary_provider") in provs:
-                self.hybrid_primary_var.set(p_data["primary_provider"])
-            if p_data.get("secondary_provider") in provs:
-                self.hybrid_secondary_var.set(p_data["secondary_provider"])
-            self.log(f"Profile '{p_name}' is a hybrid profile: primary={p_data.get('primary_provider')}, secondary={p_data.get('secondary_provider')}")
+                legacy_chain.append(p_data["primary_provider"])
+            if p_data.get("secondary_provider") in provs and p_data["secondary_provider"] not in legacy_chain:
+                legacy_chain.append(p_data["secondary_provider"])
+            if legacy_chain:
+                self.cfg["hybrid_chain"] = legacy_chain
+                self._rebuild_chain_ui()
+            self.log(f"Profile '{p_name}' is a hybrid profile: chain={legacy_chain}")
 
         self.cfg["active_provider"] = p_name
         save_config(self.cfg)
@@ -903,8 +926,7 @@ class ClaudeBridgeApp:
         self.cfg["auto_compact_window"] = self.auto_ctx_var.get()
         self.cfg["strip_images"] = self.strip_images_var.get()
         self.cfg["enable_hybrid_router"] = self.hybrid_var.get()
-        self.cfg["hybrid_primary_provider"] = self.hybrid_primary_var.get()
-        self.cfg["hybrid_secondary_provider"] = self.hybrid_secondary_var.get()
+        self.cfg["hybrid_chain"] = self._get_chain_names()
         self.cfg["hybrid_fallback"] = self.hybrid_fallback_var.get()
         self.cfg["multi_key_rotation"] = self.multi_key_var.get()
         save_config(self.cfg)
@@ -950,6 +972,7 @@ class ClaudeBridgeApp:
         self.provider_combo["values"] = list(self.cfg["providers"].keys())
         self.provider_var.set(name)
         self._on_provider_selected()
+        self._rebuild_chain_ui()
         self.log(f"Created new provider profile '{name}'. Fill in your URL/API key and click Save.")
 
     def delete_current_provider(self):
@@ -966,11 +989,17 @@ class ClaudeBridgeApp:
         del self.cfg["providers"][p_name]
         remaining = list(self.cfg["providers"].keys())
         self.cfg["active_provider"] = remaining[0]
+        # A deleted provider can no longer be a hop; drop it from the chain
+        # (and the legacy keys) so the engine doesn't resolve a dead name.
+        self.cfg["hybrid_chain"] = [n for n in self.cfg.get("hybrid_chain", []) if n != p_name]
+        self.cfg.pop("hybrid_primary_provider", None)
+        self.cfg.pop("hybrid_secondary_provider", None)
         save_config(self.cfg)
 
         self.provider_combo["values"] = remaining
         self.provider_var.set(remaining[0])
         self._on_provider_selected()
+        self._rebuild_chain_ui()
         self.log(f"Deleted provider profile '{p_name}'. Switched to '{remaining[0]}'.")
 
     def _toggle_key_visibility(self):
@@ -1083,13 +1112,117 @@ class ClaudeBridgeApp:
         self.cfg["auto_start"] = self.auto_start_var.get()
         self.cfg["boot_to_tray"] = self.boot_tray_var.get()
         self.cfg["enable_hybrid_router"] = self.hybrid_var.get()
-        self.cfg["hybrid_primary_provider"] = self.hybrid_primary_var.get()
-        self.cfg["hybrid_secondary_provider"] = self.hybrid_secondary_var.get()
+        self.cfg["hybrid_chain"] = self._get_chain_names()
         self.cfg["hybrid_fallback"] = self.hybrid_fallback_var.get()
         self.cfg["multi_key_rotation"] = self.multi_key_var.get()
         self.cfg["strip_images"] = self.strip_images_var.get()
         self.cfg["auto_compact_window"] = self.auto_ctx_var.get()
         save_config(self.cfg)
+
+    # --- Failover chain UI ---------------------------------------------------
+    def _get_chain_names(self):
+        """Chain order straight from the row comboboxes (skips empty rows)."""
+        return [v.get().strip() for v in self._chain_vars if v.get().strip()]
+
+    def _rebuild_chain_ui(self):
+        """Re-render the chain rows from cfg.
+
+        Called on startup, provider add/delete, and any chain edit. Rebuilding
+        on every change is what keeps the combobox values fresh after providers
+        are added or deleted -- the old Primary/Secondary boxes went stale.
+        """
+        for row in self._chain_rows:
+            row.destroy()
+        self._chain_rows = []
+        self._chain_vars = []
+
+        prov_names = list(self.cfg.get("providers", {}).keys())
+        chain = [n for n in self.cfg.get("hybrid_chain", []) if n in prov_names]
+        self.cfg["hybrid_chain"] = chain
+
+        for idx, name in enumerate(chain):
+            row = tk.Frame(self.chain_rows_frame, bg="#1e1e24")
+            row.pack(fill="x", pady=(2, 0))
+            self._chain_rows.append(row)
+
+            tk.Label(row, text=f"{idx + 1}.", width=3, anchor="w", font=("Segoe UI", 8, "bold"),
+                     bg="#1e1e24", fg="#71717a").pack(side="left")
+            var = tk.StringVar(value=name)
+            self._chain_vars.append(var)
+            cb = ttk.Combobox(row, textvariable=var, values=prov_names, state="readonly",
+                              width=14, font=("Segoe UI", 8))
+            cb.pack(side="left", padx=(0, 4))
+            # ttk has no command=; selection is the persistence hook. Rebuilding
+            # happens here too so the arrows/summary follow a manual rename.
+            cb.bind("<<ComboboxSelected>>", lambda _e: self._on_chain_edited())
+
+            tk.Button(row, text="▲", command=lambda i=idx: self._move_chain_entry(i, -1),
+                      font=("Segoe UI", 7), bg="#3f3f46", fg="#ffffff", relief="flat",
+                      padx=4, pady=0, cursor="hand2").pack(side="left", padx=1)
+            tk.Button(row, text="▼", command=lambda i=idx: self._move_chain_entry(i, 1),
+                      font=("Segoe UI", 7), bg="#3f3f46", fg="#ffffff", relief="flat",
+                      padx=4, pady=0, cursor="hand2").pack(side="left", padx=1)
+            tk.Button(row, text="✕", command=lambda i=idx: self._remove_chain_entry(i),
+                      font=("Segoe UI", 7), bg="#3f3f46", fg="#f87171", relief="flat",
+                      padx=4, pady=0, cursor="hand2").pack(side="left", padx=1)
+
+        # The Add combobox only offers providers not already in the chain.
+        remaining = [p for p in prov_names if p not in chain]
+        self.chain_add_combo["values"] = remaining
+        self.chain_add_var.set(remaining[0] if remaining else "")
+
+        self._update_chain_summary()
+
+    def _on_chain_edited(self):
+        """A row's provider was changed via its dropdown: persist + refresh."""
+        # Re-render so index labels and the Add picker stay consistent.
+        names = self._get_chain_names()
+        self.cfg["hybrid_chain"] = names
+        self._rebuild_chain_ui()
+        self._persist_options()
+
+    def _add_chain_provider(self):
+        name = self.chain_add_var.get().strip()
+        if not name or name in self._get_chain_names():
+            return
+        self.cfg.setdefault("hybrid_chain", []).append(name)
+        self._rebuild_chain_ui()
+        self._persist_options()
+
+    def _move_chain_entry(self, idx, delta):
+        chain = self._get_chain_names()
+        new_idx = idx + delta
+        if not (0 <= new_idx < len(chain)):
+            return
+        chain[idx], chain[new_idx] = chain[new_idx], chain[idx]
+        self.cfg["hybrid_chain"] = chain
+        self._rebuild_chain_ui()
+        self._persist_options()
+
+    def _remove_chain_entry(self, idx):
+        chain = self._get_chain_names()
+        if not (0 <= idx < len(chain)):
+            return
+        del chain[idx]
+        self.cfg["hybrid_chain"] = chain
+        self._rebuild_chain_ui()
+        self._persist_options()
+
+    def _update_chain_summary(self):
+        chain = self._get_chain_names()
+        if not chain:
+            self.chain_summary_lbl.config(
+                text="Chain empty: hybrid routing is off until you add routers.")
+            return
+        arrow = " → ".join(chain)
+        if len(chain) == 1:
+            self.chain_summary_lbl.config(
+                text=f"Chain: {arrow} (no failover target — add a 2nd router)")
+        else:
+            fast = chain[1] if len(chain) >= 2 else chain[0]
+            self.chain_summary_lbl.config(
+                text=f"Failover order: {arrow}\n"
+                     f"Sonnet/Opus start at '{chain[0]}'; Haiku/vision start at '{fast}'.")
 
     def _sync_boot_launch_flag(self):
         """The --tray flag lives inside the Run key's command, so flipping the
@@ -1141,12 +1274,11 @@ class ClaudeBridgeApp:
             "auto_compact_window": self.auto_ctx_var.get(),
             "strip_images": self.strip_images_var.get(),
             # Hybrid routing: the engine reads `all_providers` to resolve the
-            # primary/secondary router configs by name. Without these keys it
-            # silently stays single-router and never fails over.
+            # chain by name. Without these keys it silently stays single-router
+            # and never fails over.
             "all_providers": self.cfg.get("providers", {}),
             "enable_hybrid_router": self.hybrid_var.get(),
-            "hybrid_primary_provider": self.hybrid_primary_var.get(),
-            "hybrid_secondary_provider": self.hybrid_secondary_var.get(),
+            "hybrid_chain": self._get_chain_names(),
             "hybrid_fallback": self.hybrid_fallback_var.get(),
             "multi_key_rotation": self.multi_key_var.get()
         }
@@ -1187,9 +1319,9 @@ class ClaudeBridgeApp:
             self.start_btn.configure(text="⏹  STOP PROXY", bg="#ef4444", activebackground="#dc2626")
             self.log(f"Proxy successfully started on http://127.0.0.1:{port}")
             if cfg.get("enable_hybrid_router"):
+                chain = cfg.get("hybrid_chain") or []
                 self.log(
-                    f"Hybrid ON: Sonnet/Opus -> [{cfg.get('hybrid_primary_provider')}], "
-                    f"Haiku/Vision -> [{cfg.get('hybrid_secondary_provider')}]"
+                    f"Hybrid ON: chain = {' -> '.join(chain) if chain else '(empty)'}"
                     + (", failover armed" if cfg.get("hybrid_fallback", True) else ", failover OFF")
                 )
             else:
