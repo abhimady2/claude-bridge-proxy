@@ -31,11 +31,12 @@ from proxy_engine import (
     DEFAULT_CONTEXT_LENGTH,
     get_token_stats,
     reset_token_stats,
+    get_key_stats,
     parse_api_keys,
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.2"
 
 # Configuration paths
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ClaudeBridge")
@@ -593,7 +594,7 @@ class ClaudeBridgeApp:
         ).pack(side="left")
         self.multi_key_var = tk.BooleanVar(value=self.cfg.get("multi_key_rotation", True))
         tk.Checkbutton(
-            h_opts, text="Rotate API keys", variable=self.multi_key_var, command=self._persist_options,
+            h_opts, text="Rotate API keys (all modes)", variable=self.multi_key_var, command=self._persist_options,
             bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b",
             relief="flat", font=("Segoe UI", 8)
         ).pack(side="left", padx=(8, 0))
@@ -745,6 +746,7 @@ class ClaudeBridgeApp:
         self.log_area.tag_configure("info", foreground="#a1a1aa")
         self.log_area.tag_configure("ok", foreground="#4ade80")
         self.log_area.tag_configure("err", foreground="#f87171")
+        self.log_area.tag_configure("route", foreground="#60a5fa")
         self.log_area.pack(fill="both", expand=True)
         self.log_area.configure(state="disabled")
         right_pane.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
@@ -770,6 +772,19 @@ class ClaudeBridgeApp:
         )
         reset_tokens_btn.pack(side="right")
 
+        # Live API-key rotation view: one row per router, ● marks the key the
+        # next request will use and the count shows how the load is spread.
+        key_frame = tk.Frame(right_pane, bg="#27272a")
+        key_frame.pack(fill="x", pady=(4, 0))
+        tk.Label(
+            key_frame, text="Keys:", font=("Segoe UI", 9, "bold"), bg="#27272a", fg="#60a5fa"
+        ).pack(side="left", padx=(0, 8))
+        self.key_display = tk.Label(
+            key_frame, text="no requests yet", font=("Consolas", 8),
+            bg="#27272a", fg="#d4d4d8", justify="left", anchor="w"
+        )
+        self.key_display.pack(side="left", fill="x", expand=True)
+
         self.log(f"Claude Bridge v{APP_VERSION} initialized. Ready to start.")
 
         # ponytail: 2s poll of a module-level dict. No per-request work and no
@@ -787,10 +802,38 @@ class ClaudeBridgeApp:
             text=f"↑ {s['input']:,} · ↓ {s['output']:,} · Σ {s['total']:,} · {s['requests']} reqs"
         )
 
+    def _refresh_key_display(self):
+        """Render which key each router is rotating through, and its request
+        share. Fed by the same 2s poll as the token counter."""
+        stats = get_key_stats()
+        if not stats:
+            self.key_display.configure(text="no requests yet")
+            return
+        # Resolve router URLs back to profile names so the rows read like the
+        # provider dropdown instead of raw endpoints.
+        name_by_url = {}
+        for name, p in self.cfg.get("providers", {}).items():
+            url = (p.get("router_url") or "").rstrip("/")
+            if url:
+                name_by_url.setdefault(url, name)
+
+        rows = []
+        for url, st in stats.items():
+            if not st["keys"]:
+                continue
+            label = name_by_url.get(url.rstrip("/"), url)
+            chips = [
+                ("●" if k["masked"] == st["active"] else "○") + f"{k['masked']} {k['requests']}"
+                for k in st["keys"]
+            ]
+            rows.append(f"{label}:  " + "   ".join(chips))
+        self.key_display.configure(text="\n".join(rows) if rows else "no requests yet")
+
     def _poll_tokens(self):
-        """Background token counter refresh. Re-arms itself until the window dies."""
+        """Background counter refresh. Re-arms itself until the window dies."""
         try:
             self._refresh_token_display()
+            self._refresh_key_display()
         except Exception:
             return
         self.root.after(2000, self._poll_tokens)
@@ -1235,7 +1278,12 @@ class ClaudeBridgeApp:
         def _append():
             ts = datetime.now().strftime("%H:%M:%S")
             lower = text.lower()
-            if "error" in lower or "failed" in lower or "failover" in lower or "rotating" in lower:
+            # Routing decisions are informational even though the line names the
+            # failover chain -- keep them blue rather than letting the word
+            # "failover" paint every route as an error.
+            if text.startswith("Hybrid Route:"):
+                tag = "route"
+            elif "error" in lower or "failed" in lower or "failover" in lower or "rotating" in lower:
                 tag = "err"
             elif "successfully" in lower or "started" in lower:
                 tag = "ok"

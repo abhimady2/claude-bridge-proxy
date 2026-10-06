@@ -63,16 +63,24 @@ def parse_api_keys(key_val):
 
 
 def select_api_key(router_url, api_keys_list, multi_key_enabled=True):
-    """Round-robin selection of active API key across requests."""
+    """Round-robin selection of active API key across requests.
+
+    Rotation is per router and independent of hybrid routing, so a normal
+    (non-hybrid) chat spreads across the whole pool when the rotate-keys option
+    is on. The pick is recorded for the app's live key view.
+    """
     if not api_keys_list:
         return ""
     if not multi_key_enabled or len(api_keys_list) == 1:
-        return api_keys_list[0]
+        key = api_keys_list[0]
+        _record_key_use(router_url, key, api_keys_list)
+        return key
     with _key_lock:
         idx = _key_round_robin.get(router_url, 0)
         key = api_keys_list[idx % len(api_keys_list)]
         _key_round_robin[router_url] = idx + 1
-        return key
+    _record_key_use(router_url, key, api_keys_list)
+    return key
 
 
 def next_untried_key(router_url, api_keys_list, tried):
@@ -93,6 +101,55 @@ def next_untried_key(router_url, api_keys_list, tried):
                 _key_round_robin[router_url] = start + i + 1
                 return key
     return None
+
+
+# --- Key usage telemetry (live view in the app) -------------------------------
+# Counts are taken at selection time, which is the one point every request path
+# passes through. A key swapped in by 429 rotation mid-request is not counted
+# separately -- the next request's selection corrects the active marker.
+_key_stats = {}          # router_url -> {"order": [key, ...], "counts": {key: n}, "active": key}
+_key_stats_lock = threading.Lock()
+
+
+def mask_key(key):
+    """Identifiable but not copyable: dahl_…Uz8f. Never returns a whole key."""
+    if not key:
+        return "(none)"
+    if len(key) <= 8:
+        return "…" + key[-4:]
+    return f"{key[:5]}…{key[-4:]}"
+
+
+def _record_key_use(router_url, key, pool):
+    if not key:
+        return
+    with _key_stats_lock:
+        st = _key_stats.get(router_url)
+        if st is None:
+            st = {"order": [], "counts": {}, "active": ""}
+            _key_stats[router_url] = st
+        for k in pool or [key]:
+            if k not in st["counts"]:
+                st["counts"][k] = 0
+                st["order"].append(k)
+        st["counts"][key] = st["counts"].get(key, 0) + 1
+        st["active"] = key
+
+
+def get_key_stats():
+    """Per-router key rotation snapshot for the app: masked keys, request counts,
+    and which one is live. Masked so a screenshot never leaks a key."""
+    with _key_stats_lock:
+        return {
+            url: {
+                "active": mask_key(st.get("active", "")),
+                "keys": [
+                    {"masked": mask_key(k), "requests": st["counts"].get(k, 0)}
+                    for k in st["order"]
+                ],
+            }
+            for url, st in _key_stats.items()
+        }
 
 
 # --- Image to Local Disk Bridge (Vision for Atria & TokenPlan limit fix) -------
@@ -1412,6 +1469,34 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _commit_stream_start(self, target_model, anthropic_req, msg_id):
+        """Send 200 + SSE headers + message_start. Deferred until the first
+        upstream data byte so a pre-first-byte stall can still fail over --
+        the caller owns the stream_started flag."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.close_connection = True
+
+        start_evt = {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": anthropic_req.get("model", target_model),
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        }
+        self.wfile.write(f"event: message_start\ndata: {json.dumps(start_evt)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
     def _handle_messages(self, anthropic_req, cfg, tb=None):
         """Full message dispatch. cfg is the resolved provider config."""
         tb = tb or {}
@@ -1609,41 +1694,142 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                 self.wfile.write(err_body.encode("utf-8"))
                                 return
 
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                    self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "close")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.close_connection = True
-                    stream_started = True
-
-                    # 1. Start message event
-                    start_evt = {
-                        "type": "message_start",
-                        "message": {
-                            "id": msg_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "model": anthropic_req.get("model", target_model),
-                            "content": [],
-                            "stop_reason": None,
-                            "stop_sequence": None,
-                            "usage": {"input_tokens": 0, "output_tokens": 0}
-                        }
-                    }
-                    self.wfile.write(f"event: message_start\ndata: {json.dumps(start_evt)}\n\n".encode("utf-8"))
-                    self.wfile.flush()
-
+                    # 200 + message_start are held back until the first upstream
+                    # data byte arrives. A router that stalls before producing
+                    # anything (the Dahl freeze) then raises with stream_started
+                    # still False, and the TransportError handler below fails
+                    # over to the next router instead of closing an empty turn.
+                    committed = False
                     thinking_mode = cfg.get("thinking_mode", "thinking_block")
                     thinking_block_started = False
                     text_block_started = False
-                    tool_blocks = {} # index -> {"id", "name", "args"}
+                    tool_blocks = {}  # index -> {"id", "name", "args"}
                     current_block_index = 0
                     has_tools = False
                     in_think_tag = False
+                    # Content is buffered up to one tag-length deep. A <think> tag
+                    # split across two SSE chunks must never be emitted: a partial
+                    # "<thi" printed as text is the leak seen in chat, and a split
+                    # *closing* tag used to leave in_think_tag stuck at True, so
+                    # every later chunk landed in the hidden thinking block and
+                    # the visible answer was empty -- the "chat went dead" turn.
+                    pending = ""
                     stream_in = 0
                     stream_out = 0
+
+                    def _close_text_block():
+                        nonlocal text_block_started, current_block_index
+                        if not text_block_started:
+                            return
+                        stop_evt = {"type": "content_block_stop", "index": current_block_index}
+                        self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(stop_evt)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                        current_block_index += 1
+                        text_block_started = False
+
+                    def _emit_text(text):
+                        nonlocal text_block_started
+                        if not text:
+                            return
+                        if not text_block_started:
+                            b_start = {
+                                "type": "content_block_start",
+                                "index": current_block_index,
+                                "content_block": {"type": "text", "text": ""}
+                            }
+                            self.wfile.write(f"event: content_block_start\ndata: {json.dumps(b_start)}\n\n".encode("utf-8"))
+                            text_block_started = True
+                        t_evt = {
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {"type": "text_delta", "text": text}
+                        }
+                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(t_evt)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+
+                    def _close_thinking_block():
+                        nonlocal thinking_block_started, current_block_index
+                        if not thinking_block_started:
+                            return
+                        sig_evt = {
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {"type": "signature_delta", "signature": "bridge_sig"}
+                        }
+                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(sig_evt)}\n\n".encode("utf-8"))
+                        stop_evt = {"type": "content_block_stop", "index": current_block_index}
+                        self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(stop_evt)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                        current_block_index += 1
+                        thinking_block_started = False
+
+                    def _emit_thinking(text):
+                        nonlocal thinking_block_started
+                        if not text:
+                            return
+                        if thinking_mode == "raw":
+                            _emit_text(text)
+                            return
+                        if thinking_mode != "thinking_block":
+                            return  # "strip": drop reasoning entirely
+                        if not thinking_block_started:
+                            b_start = {
+                                "type": "content_block_start",
+                                "index": current_block_index,
+                                "content_block": {"type": "thinking", "thinking": ""}
+                            }
+                            self.wfile.write(f"event: content_block_start\ndata: {json.dumps(b_start)}\n\n".encode("utf-8"))
+                            thinking_block_started = True
+                        t_evt = {
+                            "type": "content_block_delta",
+                            "index": current_block_index,
+                            "delta": {"type": "thinking_delta", "thinking": text}
+                        }
+                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(t_evt)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+
+                    def _holdback(buf, tag):
+                        """Length of the longest suffix of buf that could still grow
+                        into tag -- the part that must wait for the next chunk."""
+                        for n in range(min(len(tag) - 1, len(buf)), 0, -1):
+                            if buf.endswith(tag[:n]):
+                                return n
+                        return 0
+
+                    def _feed(content_piece):
+                        """Split content into visible text and <think> reasoning.
+                        Everything that cannot be part of a split tag is emitted
+                        immediately; only an ambiguous tail is held back."""
+                        nonlocal pending, in_think_tag
+                        pending += content_piece
+                        while True:
+                            tag = "</think>" if in_think_tag else "<think>"
+                            idx = pending.find(tag)
+                            if idx == -1:
+                                cut = len(pending) - _holdback(pending, tag)
+                                if in_think_tag:
+                                    _emit_thinking(pending[:cut])
+                                else:
+                                    _emit_text(pending[:cut])
+                                pending = pending[cut:]
+                                return
+                            if in_think_tag:
+                                _emit_thinking(pending[:idx])
+                                _close_thinking_block()
+                                in_think_tag = False
+                            else:
+                                _emit_text(pending[:idx])
+                                _close_text_block()
+                                in_think_tag = True
+                            pending = pending[idx + len(tag):]
+
+                    def _commit():
+                        nonlocal committed, stream_started
+                        if committed:
+                            return
+                        self._commit_stream_start(target_model, anthropic_req, msg_id)
+                        committed = True
+                        stream_started = True
 
                     # Same stall guard as the anthropic-native path: an upstream
                     # can keep the socket warm with SSE comment lines (": ping")
@@ -1663,7 +1849,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         data_str = line[5:].strip()
                         if data_str == "[DONE]":
                             break
-                        
+
+                        # First real upstream byte: the router is alive, so it is
+                        # now safe to commit the 200 + message_start.
+                        _commit()
+
                         try:
                             chunk = json.loads(data_str)
                         except Exception:
@@ -1685,190 +1875,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         reasoning_piece = delta.get("reasoning_content")
                         content_piece = delta.get("content")
 
-                        # 1. Handle reasoning_content
-                        if reasoning_piece:
-                            if thinking_mode == "thinking_block":
-                                if not thinking_block_started:
-                                    block_start = {
-                                        "type": "content_block_start",
-                                        "index": current_block_index,
-                                        "content_block": {"type": "thinking", "thinking": ""}
-                                    }
-                                    self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode("utf-8"))
-                                    thinking_block_started = True
+                        # 1. reasoning_content arrives already typed as reasoning:
+                        #    no tag parsing -- straight to a thinking block (or to
+                        #    text in "raw" mode, or dropped in "strip" mode).
+                        _emit_thinking(reasoning_piece or "")
 
-                                delta_evt = {
-                                    "type": "content_block_delta",
-                                    "index": current_block_index,
-                                    "delta": {"type": "thinking_delta", "thinking": reasoning_piece}
-                                }
-                                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_evt)}\n\n".encode("utf-8"))
-                                self.wfile.flush()
-                            elif thinking_mode == "raw":
-                                if not text_block_started:
-                                    block_start = {
-                                        "type": "content_block_start",
-                                        "index": current_block_index,
-                                        "content_block": {"type": "text", "text": ""}
-                                    }
-                                    self.wfile.write(f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode("utf-8"))
-                                    text_block_started = True
-
-                                delta_evt = {
-                                    "type": "content_block_delta",
-                                    "index": current_block_index,
-                                    "delta": {"type": "text_delta", "text": reasoning_piece}
-                                }
-                                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_evt)}\n\n".encode("utf-8"))
-                                self.wfile.flush()
-                            # if thinking_mode == "strip", ignore reasoning_piece completely
-
-                        # 2. Handle content
+                        # 2. Visible content, which may carry inline <think> tags.
                         if content_piece:
-                            # If thinking block was active via reasoning_content, close it before text
+                            # A thinking block opened by reasoning_content has to
+                            # be closed before visible text starts.
                             if thinking_block_started and not in_think_tag:
-                                sig_evt = {
-                                    "type": "content_block_delta",
-                                    "index": current_block_index,
-                                    "delta": {"type": "signature_delta", "signature": "bridge_sig"}
-                                }
-                                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(sig_evt)}\n\n".encode("utf-8"))
-                                stop_evt = {"type": "content_block_stop", "index": current_block_index}
-                                self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(stop_evt)}\n\n".encode("utf-8"))
-                                self.wfile.flush()
-                                current_block_index += 1
-                                thinking_block_started = False
-
-                            pending_text = content_piece
-                            while pending_text:
-                                if not in_think_tag:
-                                    if "<think>" in pending_text:
-                                        before_think, pending_text = pending_text.split("<think>", 1)
-                                        if before_think:
-                                            if not text_block_started:
-                                                b_start = {
-                                                    "type": "content_block_start",
-                                                    "index": current_block_index,
-                                                    "content_block": {"type": "text", "text": ""}
-                                                }
-                                                self.wfile.write(f"event: content_block_start\ndata: {json.dumps(b_start)}\n\n".encode("utf-8"))
-                                                text_block_started = True
-                                            t_evt = {
-                                                "type": "content_block_delta",
-                                                "index": current_block_index,
-                                                "delta": {"type": "text_delta", "text": before_think}
-                                            }
-                                            self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(t_evt)}\n\n".encode("utf-8"))
-                                            self.wfile.flush()
-
-                                        if text_block_started:
-                                            stop_evt = {"type": "content_block_stop", "index": current_block_index}
-                                            self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(stop_evt)}\n\n".encode("utf-8"))
-                                            current_block_index += 1
-                                            text_block_started = False
-
-                                        in_think_tag = True
-                                        if thinking_mode == "thinking_block" and not thinking_block_started:
-                                            b_start = {
-                                                "type": "content_block_start",
-                                                "index": current_block_index,
-                                                "content_block": {"type": "thinking", "thinking": ""}
-                                            }
-                                            self.wfile.write(f"event: content_block_start\ndata: {json.dumps(b_start)}\n\n".encode("utf-8"))
-                                            thinking_block_started = True
-                                    else:
-                                        if not text_block_started:
-                                            b_start = {
-                                                "type": "content_block_start",
-                                                "index": current_block_index,
-                                                "content_block": {"type": "text", "text": ""}
-                                            }
-                                            self.wfile.write(f"event: content_block_start\ndata: {json.dumps(b_start)}\n\n".encode("utf-8"))
-                                            text_block_started = True
-                                        t_evt = {
-                                            "type": "content_block_delta",
-                                            "index": current_block_index,
-                                            "delta": {"type": "text_delta", "text": pending_text}
-                                        }
-                                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(t_evt)}\n\n".encode("utf-8"))
-                                        self.wfile.flush()
-                                        pending_text = ""
-                                else:
-                                    if "</think>" in pending_text:
-                                        think_content, pending_text = pending_text.split("</think>", 1)
-                                        if think_content:
-                                            if thinking_mode == "thinking_block":
-                                                t_evt = {
-                                                    "type": "content_block_delta",
-                                                    "index": current_block_index,
-                                                    "delta": {"type": "thinking_delta", "thinking": think_content}
-                                                }
-                                                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(t_evt)}\n\n".encode("utf-8"))
-                                                self.wfile.flush()
-                                            elif thinking_mode == "raw":
-                                                if not text_block_started:
-                                                    b_start = {
-                                                        "type": "content_block_start",
-                                                        "index": current_block_index,
-                                                        "content_block": {"type": "text", "text": ""}
-                                                    }
-                                                    self.wfile.write(f"event: content_block_start\ndata: {json.dumps(b_start)}\n\n".encode("utf-8"))
-                                                    text_block_started = True
-                                                t_evt = {
-                                                    "type": "content_block_delta",
-                                                    "index": current_block_index,
-                                                    "delta": {"type": "text_delta", "text": think_content}
-                                                }
-                                                self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(t_evt)}\n\n".encode("utf-8"))
-                                                self.wfile.flush()
-
-                                        if thinking_block_started:
-                                            sig_evt = {
-                                                "type": "content_block_delta",
-                                                "index": current_block_index,
-                                                "delta": {"type": "signature_delta", "signature": "bridge_sig"}
-                                            }
-                                            self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(sig_evt)}\n\n".encode("utf-8"))
-                                            stop_evt = {"type": "content_block_stop", "index": current_block_index}
-                                            self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(stop_evt)}\n\n".encode("utf-8"))
-                                            self.wfile.flush()
-                                            current_block_index += 1
-                                            thinking_block_started = False
-                                        in_think_tag = False
-                                    else:
-                                        if thinking_mode == "thinking_block":
-                                            if not thinking_block_started:
-                                                b_start = {
-                                                    "type": "content_block_start",
-                                                    "index": current_block_index,
-                                                    "content_block": {"type": "thinking", "thinking": ""}
-                                                }
-                                                self.wfile.write(f"event: content_block_start\ndata: {json.dumps(b_start)}\n\n".encode("utf-8"))
-                                                thinking_block_started = True
-                                            t_evt = {
-                                                "type": "content_block_delta",
-                                                "index": current_block_index,
-                                                "delta": {"type": "thinking_delta", "thinking": pending_text}
-                                            }
-                                            self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(t_evt)}\n\n".encode("utf-8"))
-                                            self.wfile.flush()
-                                        elif thinking_mode == "raw":
-                                            if not text_block_started:
-                                                b_start = {
-                                                    "type": "content_block_start",
-                                                    "index": current_block_index,
-                                                    "content_block": {"type": "text", "text": ""}
-                                                }
-                                                self.wfile.write(f"event: content_block_start\ndata: {json.dumps(b_start)}\n\n".encode("utf-8"))
-                                                text_block_started = True
-                                            t_evt = {
-                                                "type": "content_block_delta",
-                                                "index": current_block_index,
-                                                "delta": {"type": "text_delta", "text": pending_text}
-                                            }
-                                            self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(t_evt)}\n\n".encode("utf-8"))
-                                            self.wfile.flush()
-                                        pending_text = ""
+                                _close_thinking_block()
+                            _feed(content_piece)
 
                         # 3. Tool calls
                         tool_calls_chunk = delta.get("tool_calls", [])
@@ -1922,6 +1940,28 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                 }
                                 self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(tool_delta)}\n\n".encode("utf-8"))
                                 self.wfile.flush()
+
+                    # Flush whatever the split-tag buffer was still holding back.
+                    if pending:
+                        if in_think_tag:
+                            _emit_thinking(pending)
+                        else:
+                            _emit_text(pending)
+                        pending = ""
+
+                    if not stream_started:
+                        # Not one byte of usable data arrived (the Dahl freeze).
+                        if allow_fallback and fallback_cfg and fallback_cfg.get("router_url"):
+                            # Nothing has been sent to Claude Code yet, so the
+                            # request can be handed to the next router instead of
+                            # committing an empty turn -- an empty turn is what
+                            # left the chat looking dead however often it was
+                            # retried.
+                            raise httpx.TransportError("upstream delivered no data")
+                        # Single router, nothing else to try: commit the 200 and
+                        # close the turn so Claude Code can continue rather than
+                        # wait on a stream that will never emit a terminal event.
+                        _commit()
 
                     # Close any open blocks
                     if thinking_block_started:
