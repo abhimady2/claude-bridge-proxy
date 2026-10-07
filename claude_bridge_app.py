@@ -36,7 +36,7 @@ from proxy_engine import (
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 
 # Configuration paths
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ClaudeBridge")
@@ -495,6 +495,21 @@ class ClaudeBridgeApp:
         self.key_var.trace_add("write", _refresh_key_pool)
         _refresh_key_pool()
 
+        # 2b. Egress Proxy (route this provider's traffic through a VPN/proxy)
+        proxy_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
+        proxy_frame.pack(fill="x", pady=(0, 8))
+        proxy_head = tk.Frame(proxy_frame, bg="#1e1e24")
+        proxy_head.pack(fill="x")
+        ttk.Label(proxy_head, text="Egress Proxy (http://127.0.0.1:7890, socks5://127.0.0.1:1080, or empty)", style="FieldLabel.TLabel").pack(side="left", anchor="w", expand=True)
+        self.proxy_url_var = tk.StringVar(value=cur_p_data.get("egress_proxy", ""))
+        self.proxy_url_entry = tk.Entry(
+            proxy_frame, textvariable=self.proxy_url_var, font=("Segoe UI", 10),
+            bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat",
+            highlightbackground="#52525b", highlightthickness=1
+        )
+        self.proxy_url_entry.pack(fill="x", pady=(2, 0), ipady=4)
+        ttk.Label(proxy_frame, text="If all keys 429 at once, your IP is rate-limited. Point this at a VPN/proxy (e.g. Clash/WARP local port) to egress on another IP.", style="FieldLabel.TLabel", font=("Segoe UI", 7)).pack(anchor="w", pady=(2, 0))
+
         # 3. Model & Port Row
         row_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
         row_frame.pack(fill="x", pady=(0, 8))
@@ -851,6 +866,8 @@ class ClaudeBridgeApp:
 
         self.url_var.set(p_data.get("router_url", ""))
         self.key_var.set(p_data.get("api_key", ""))
+        if hasattr(self, "proxy_url_var"):
+            self.proxy_url_var.set(p_data.get("egress_proxy", ""))
         self.model_var.set(p_data.get("model", ""))
         self.sonnet_var.set(p_data.get("sonnet_model", p_data.get("model", "")))
         self.opus_var.set(p_data.get("opus_model", p_data.get("model", "")))
@@ -956,7 +973,8 @@ class ClaudeBridgeApp:
             "model": self.model_var.get().strip(),
             "sonnet_model": self.sonnet_var.get().strip(),
             "opus_model": self.opus_var.get().strip(),
-            "haiku_model": self.haiku_var.get().strip()
+            "haiku_model": self.haiku_var.get().strip(),
+            "egress_proxy": self.proxy_url_var.get().strip() if hasattr(self, "proxy_url_var") else self.cfg["providers"].get(p_name, {}).get("egress_proxy", "")
         })
         self.cfg["providers"][p_name] = merged
         self.cfg["active_provider"] = p_name

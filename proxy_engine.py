@@ -11,9 +11,8 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import httpx
 import anthropic
 
-# ponytail: one shared pooled client instead of one per request. Each request
-# otherwise re-does DNS+TCP+TLS (~100-400ms) before the first byte arrives.
-# httpx.Client is thread-safe; ThreadingHTTPServer hits it concurrently.
+# ponytail: one shared pooled client instead of one per request; egress
+# proxies (per-provider `egress_proxy`) are threaded through the Transport.
 _client = None
 _client_lock = threading.Lock()
 
@@ -21,19 +20,39 @@ _anthropic_clients = {}
 _anthropic_lock = threading.Lock()
 
 
-def _get_anthropic_client(api_key, base_url):
-    key = (api_key, base_url)
+def _proxy_arg(proxy_url: str):
+    """httpx accepts a proxy string (http/socks5) or a Transport per URL."""
+    return proxy_url or None
+
+
+def _maketransport(proxy_url):
+    if not proxy_url:
+        return None
+    return httpx.HTTPTransport(
+        proxy=_proxy_arg(proxy_url),
+        limits=httpx.Limits(
+            max_keepalive_connections=8,
+            max_connections=32,
+        ),
+        trust_env=False,
+    )
+
+
+def _get_anthropic_client(api_key, base_url, proxy_url=None):
+    key = (api_key, base_url, proxy_url)
     with _anthropic_lock:
         if key not in _anthropic_clients:
             headers = {}
             if "agentrouter" in base_url.lower():
                 headers["User-Agent"] = "claude-cli/1.0.0 (external, cli)"
+            transport = _maketransport(proxy_url)
             _anthropic_clients[key] = anthropic.Anthropic(
                 api_key=api_key if api_key else "placeholder",
                 base_url=base_url,
                 default_headers=headers if headers else None,
                 timeout=600.0,
-                max_retries=2
+                max_retries=2,
+                transport=transport,
             )
         return _anthropic_clients[key]
 
@@ -329,6 +348,7 @@ def process_anthropic_images(messages, auto_save=True, strip_images=False):
 
 
 def _get_client():
+    """Shared pooled httpx.Client for the OpenAI-style router paths."""
     global _client
     if _client is None:
         with _client_lock:
@@ -349,6 +369,49 @@ def _close_client():
         if _client is not None:
             _client.close()
             _client = None
+
+
+# ponytail: per-provider egress proxies. `_get_client_for` hands back either
+# the shared proxy-less client or a per-proxy ephemeral httpx.Client; both are
+# bound to the request already (the per-proxy one gets closed at end of the
+# request that used it). Anthropic-native paths pass the proxy to
+# `_get_anthropic_client`'s transport instead.
+_proxy_clients = {}
+_proxy_clients_lock = threading.Lock()
+
+
+def _client_for_url(proxy_url):
+    """Return a fixed client for a proxy; locks the proxy to its own pool.
+
+    ponytail: most requests never use the proxy-path branch (no proxy set), so
+    the pool only ever holds proxies the user actually configured. Since httpx
+    cannot re-point an open connection + pool at a differently-proxied host, a
+    proxy'd client cannot be shared with the plain one; the proxy path keeps
+    its own small pool instead.
+    """
+    if not proxy_url:
+        return _get_client(), False
+    with _proxy_clients_lock:
+        client = _proxy_clients.get(proxy_url)
+    if client is None:
+        client = httpx.Client(
+            transport=_maketransport(proxy_url),
+            limits=httpx.Limits(max_keepalive_connections=8, max_connections=32),
+            timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0),
+        )
+        with _proxy_clients_lock:
+            _proxy_clients[proxy_url] = client
+    return client, True
+
+
+def close_proxy_clients():
+    with _proxy_clients_lock:
+        for c in _proxy_clients.values():
+            try:
+                c.close()
+            except Exception:
+                pass
+        _proxy_clients.clear()
 
 
 # Upstream SSE streams can stall mid-response with no bytes (dead router, dropped
@@ -939,7 +1002,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         multi_key_enabled = cfg.get("multi_key_rotation", True)
         current_key = select_api_key(router_url, api_keys, multi_key_enabled)
         tried_keys = set()  # keys already attempted for this request (429 failover)
-        client = _get_anthropic_client(current_key, base_url)
+        egress_proxy = (cfg.get("egress_proxy") or "").strip()
+        client = _get_anthropic_client(current_key, base_url, egress_proxy)
         is_stream = anthropic_req.get("stream", True)
         # True once the 200 + SSE headers went out. An exception after that
         # point cannot send a fresh HTTP status, so the turn must be closed
@@ -986,9 +1050,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             new_m = f"...{alt_key[-4:]}" if len(alt_key) >= 4 else "key"
                             self.emit_log(f"Key {old_m} hit limit ({resp.status_code}). Rotating to {new_m}...")
                             current_key = alt_key
-                            client = _get_anthropic_client(alt_key, base_url)
+                            client = _get_anthropic_client(alt_key, base_url, egress_proxy)
                             tried_keys.add(alt_key)
                             return _execute_streaming(req_dict)
+                        if not egress_proxy and len(api_keys) > 1:
+                            self.emit_log("Every key hit 429 - looks like an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                     if resp.status_code != 200:
                         err_body = resp.read().decode("utf-8", errors="replace")
@@ -1128,9 +1194,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         new_m = f"...{alt_key[-4:]}" if len(alt_key) >= 4 else "key"
                         self.emit_log(f"Key {old_m} hit limit ({status}). Failing over to next key {new_m}...")
                         current_key = alt_key
-                        client = _get_anthropic_client(alt_key, base_url)
+                        client = _get_anthropic_client(alt_key, base_url, egress_proxy)
                         tried_keys.add(alt_key)
                         return _execute_streaming(req_dict)
+                    if not egress_proxy and len(api_keys) > 1:
+                        self.emit_log("Every key hit 429 - likely an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                 # Fallback to default_model if target_model failed due to quota (402) or unavailable (404/503)
                 if status in (400, 402, 404, 503) and default_model and req_dict.get("model") != default_model:
@@ -1258,9 +1326,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         new_m = f"...{alt_key[-4:]}" if len(alt_key) >= 4 else "key"
                         self.emit_log(f"Key {old_m} hit limit ({status}). Failing over to next key {new_m}...")
                         current_key = alt_key
-                        client = _get_anthropic_client(alt_key, base_url)
+                        client = _get_anthropic_client(alt_key, base_url, egress_proxy)
                         tried_keys.add(alt_key)
                         return _execute_non_streaming(req_dict)
+                    if not egress_proxy and len(api_keys) > 1:
+                        self.emit_log("Every key hit 429 - likely an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                 # Fallback to default_model if target_model failed due to quota (402) or unavailable (404/503)
                 if status in (400, 402, 404, 503) and default_model and req_dict.get("model") != default_model:
@@ -1562,12 +1632,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         api_keys = parse_api_keys(api_key)
         multi_key_enabled = active_cfg.get("multi_key_rotation", True)
         current_key = select_api_key(router_url, api_keys, multi_key_enabled)
+        egress_proxy = (active_cfg.get("egress_proxy") or "").strip()
 
         req_headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {current_key}" if current_key else ""
         }
-        
+
         is_stream = anthropic_req.get("stream", True)
         openai_req["stream"] = is_stream
         if is_stream:
@@ -1582,7 +1653,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         stream_in = 0
         stream_out = 0
         try:
-            client = _get_client()
+            client, _is_proxied = _client_for_url(egress_proxy)
             if is_stream:
                 # Stream response
                 with client.stream("POST", endpoint, headers=req_headers, json=openai_req,
@@ -1623,6 +1694,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                     retry_ctx.__exit__(None, None, None)
                                 except Exception:
                                     pass
+                        else:
+                            if not egress_proxy:
+                                self.emit_log("Every key hit 429 - likely an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                     if resp.status_code != 200:
                         try:
@@ -2020,6 +2094,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         elif retry_resp.status_code not in (429, 402):
                             resp = retry_resp
                             break
+                    else:
+                        if not egress_proxy:
+                            self.emit_log("Every key hit 429 - likely an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                 if resp.status_code != 200:
                     err_body = resp.text

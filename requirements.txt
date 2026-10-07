@@ -2,3 +2,4 @@ httpx
 anthropic
 pillow
 pystray
+socksio
