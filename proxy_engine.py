@@ -1805,6 +1805,14 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         nonlocal text_block_started
                         if not text:
                             return
+                        # Dahl drops the  opens and streams reasoning in its own
+                        # field, so the content stream can carry orphan </thinking>
+                        # markers (a native DeepSeek emit leaked as literal text).
+                        # Balanced pairs never reach here (_feed routes them to the
+                        # thinking block), so removing orphans is safe.
+                        text = text.replace(" response", "").replace("<thinking>", "").replace("</thinking>", "")
+                        if not text:
+                            return
                         if not text_block_started:
                             b_start = {
                                 "type": "content_block_start",
@@ -1946,7 +1954,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         choice = choices[0]
                         delta = choice.get("delta", {})
 
-                        reasoning_piece = delta.get("reasoning_content")
+                        reasoning_piece = delta.get("reasoning_content") or delta.get("reasoning")
                         content_piece = delta.get("content")
 
                         # 1. reasoning_content arrives already typed as reasoning:
@@ -2134,7 +2142,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 content_blocks = []
                 stop_reason = "end_turn"
 
-                raw_reasoning = choice["message"].get("reasoning_content") or ""
+                raw_reasoning = choice["message"].get("reasoning_content") or choice["message"].get("reasoning") or ""
                 raw_content = choice["message"].get("content") or ""
 
                 # Extract <think> from raw_content if present
