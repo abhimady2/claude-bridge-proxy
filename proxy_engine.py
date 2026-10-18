@@ -11,6 +11,62 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import httpx
 import anthropic
 
+# anthropic >= 1.8 speaks httpx 2.x (imported as `httpx2`) and rejects a
+# foreign client outright, so its transport has to be built from the SDK's own
+# httpx rather than the one this module uses. Older SDKs vendor plain httpx.
+try:
+    import httpx2 as _sdk_httpx
+except ImportError:
+    _sdk_httpx = httpx
+
+
+def _describe(ex):
+    """Exception type + message. `str(ex)` alone loses the type, and a bare
+    `[Errno 2] No such file or directory` names neither the file nor the kind
+    of failure -- undiagnosable from the log."""
+    return f"{type(ex).__name__}: {ex}"
+
+
+# --- TLS trust --------------------------------------------------------------
+# httpx builds its trust context from the environment (`SSL_CERT_FILE` /
+# `SSL_CERT_DIR`) and otherwise from certifi's bundled bundle. Both are plain
+# paths on disk and httpx takes them on faith, so a stale env var -- or a
+# PyInstaller `_MEI` temp file that Windows cleaned out from under the still
+# running exe -- makes `ssl.create_default_context(cafile=...)` raise
+# `FileNotFoundError: [Errno 2] No such file or directory` at *client
+# construction*. Clients are only cached on success, so from then on every
+# request fails the same way with nothing naming the missing file. Resolve the
+# context once, check the path really exists, and fall back to the OS store.
+_ssl_ctx = None
+_ssl_ctx_lock = threading.Lock()
+
+
+def _ssl_context():
+    global _ssl_ctx
+    with _ssl_ctx_lock:
+        if _ssl_ctx is None:
+            _ssl_ctx = _build_ssl_context()
+        return _ssl_ctx
+
+
+def _build_ssl_context():
+    import ssl
+    ca_file = os.environ.get("SSL_CERT_FILE")
+    if ca_file and os.path.isfile(ca_file):
+        return ssl.create_default_context(cafile=ca_file)
+    ca_dir = os.environ.get("SSL_CERT_DIR")
+    if ca_dir and os.path.isdir(ca_dir):
+        return ssl.create_default_context(capath=ca_dir)
+    try:
+        import certifi
+        bundle = certifi.where()
+        if os.path.isfile(bundle):
+            return ssl.create_default_context(cafile=bundle)
+    except Exception:
+        pass
+    return ssl.create_default_context()  # OS trust store; needs no path
+
+
 # ponytail: one shared pooled client instead of one per request; egress
 # proxies (per-provider `egress_proxy`) are threaded through the Transport.
 _client = None
@@ -25,12 +81,13 @@ def _proxy_arg(proxy_url: str):
     return proxy_url or None
 
 
-def _maketransport(proxy_url):
+def _maketransport(proxy_url, http_module=httpx):
     if not proxy_url:
         return None
-    return httpx.HTTPTransport(
+    return http_module.HTTPTransport(
         proxy=_proxy_arg(proxy_url),
-        limits=httpx.Limits(
+        verify=_ssl_context(),
+        limits=http_module.Limits(
             max_keepalive_connections=8,
             max_connections=32,
         ),
@@ -45,14 +102,22 @@ def _get_anthropic_client(api_key, base_url, proxy_url=None):
             headers = {}
             if "agentrouter" in base_url.lower():
                 headers["User-Agent"] = "claude-cli/1.0.0 (external, cli)"
-            transport = _maketransport(proxy_url)
+            http_client = _sdk_httpx.Client(
+                transport=_maketransport(proxy_url, _sdk_httpx),
+                verify=_ssl_context(),
+                limits=_sdk_httpx.Limits(
+                    max_keepalive_connections=8,
+                    max_connections=32,
+                ),
+                timeout=_sdk_httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0),
+            )
             _anthropic_clients[key] = anthropic.Anthropic(
                 api_key=api_key if api_key else "placeholder",
                 base_url=base_url,
                 default_headers=headers if headers else None,
                 timeout=600.0,
                 max_retries=2,
-                transport=transport,
+                http_client=http_client,
             )
         return _anthropic_clients[key]
 
@@ -216,6 +281,21 @@ def strip_inline_images(openai_req):
         msg["content"] = kept
     return openai_req
 
+def openai_req_has_image(openai_req):
+    """True if the converted request actually carries an inline image part.
+
+    Guards the inline-image rejection heuristic: without this, any 400 whose
+    error body happens to mention "image" would permanently disable vision for
+    a router that accepts images just fine."""
+    for msg in openai_req.get("messages", []):
+        c = msg.get("content")
+        if isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
+
+
 # Media types OpenAI-compatible vision endpoints accept inline. Anything else
 # (svg, bmp, ...) is passed as a disk path rather than risking a 400.
 VISION_MEDIA_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
@@ -354,6 +434,7 @@ def _get_client():
         with _client_lock:
             if _client is None:
                 _client = httpx.Client(
+                    verify=_ssl_context(),
                     limits=httpx.Limits(
                         max_keepalive_connections=32,
                         max_connections=128,
@@ -396,6 +477,7 @@ def _client_for_url(proxy_url):
     if client is None:
         client = httpx.Client(
             transport=_maketransport(proxy_url),
+            verify=_ssl_context(),
             limits=httpx.Limits(max_keepalive_connections=8, max_connections=32),
             timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0),
         )
@@ -634,6 +716,7 @@ def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=T
             image_parts = []
             tool_calls = []
             tool_results = []
+            tool_images = []
             reasoning_parts = []
             
             for block in content:
@@ -685,23 +768,31 @@ def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=T
                                 if sub_b.get("type") == "text":
                                     parts.append(sub_b.get("text", ""))
                                 elif sub_b.get("type") == "image":
-                                    if auto_save_images:
-                                        src = sub_b.get("source") or {}
-                                        if src.get("type") == "base64" and src.get("data"):
-                                            p = save_base64_image(src.get("media_type", "image/png"), src.get("data"))
-                                            if p:
-                                                # OpenAI `tool` messages carry text only, so a
-                                                # tool-returned image can only be passed as a path.
-                                                # Must NOT say "read this file": a Read returns an
-                                                # image block that lands right back here, so the
-                                                # model would read its own output forever.
-                                                parts.append(
-                                                    f"[A tool returned an image ({p}). OpenAI tool "
-                                                    f"messages cannot carry image data, so it is not "
-                                                    f"included here. Do NOT Read {p} to retry -- that "
-                                                    f"returns another image and repeats this. Continue "
-                                                    f"without the image, or ask the user to describe it.]"
-                                                )
+                                    src = sub_b.get("source") or {}
+                                    if src.get("type") == "base64" and src.get("data"):
+                                        media_type = (src.get("media_type") or "image/png").lower().strip()
+                                        saved_path = save_base64_image(media_type, src.get("data")) if auto_save_images else None
+                                        if not strip_images and media_type in VISION_MEDIA_TYPES:
+                                            # OpenAI `tool` messages carry text only, so a
+                                            # tool-returned image cannot ride inside the tool
+                                            # result. Attach it as a user message right after the
+                                            # tool result instead: the model sees the image, and a
+                                            # Read no longer loops on its own stripped output.
+                                            tool_images.append({
+                                                "type": "image_url",
+                                                "image_url": {"url": f"data:{media_type};base64,{clean_base64(src['data'])}"}
+                                            })
+                                        elif saved_path:
+                                            # Strip path: this router cannot receive images, so a
+                                            # Read would return an image block that lands right back
+                                            # here -- the model would read its own output forever.
+                                            parts.append(
+                                                f"[A tool returned an image ({saved_path}). OpenAI tool "
+                                                f"messages cannot carry image data, so it is not "
+                                                f"included here. Do NOT Read {saved_path} to retry -- that "
+                                                f"returns another image and repeats this. Continue "
+                                                f"without the image, or ask the user to describe it.]"
+                                            )
                         res_content = "\n".join(parts)
                     tool_results.append({
                         "role": "tool",
@@ -738,6 +829,15 @@ def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=T
             else:
                 for tr in tool_results:
                     messages.append(tr)
+                if tool_images:
+                    # One user message carrying every tool-returned image, after the
+                    # tool results it belongs to. Keeps tool-call/tool-result pairs
+                    # adjacent and stays valid on strict OpenAI gateways.
+                    messages.append({"role": "user", "content": [
+                        {"type": "text", "text": "[A tool returned the image(s) attached below. OpenAI "
+                         "tool messages cannot carry image parts, so they are forwarded here. "
+                         "The image(s) are visible to you -- continue the task.]"},
+                        *tool_images]})
                 if text_parts or image_parts:
                     messages.append({"role": role, "content": openai_message_content(text_parts, image_parts)})
                 elif not tool_results:
@@ -839,6 +939,49 @@ def trim_openai_messages(messages, max_bytes=650000):
         accum_bytes += turn_bytes
 
     flattened = [m for turn in retained_turns for m in turn]
+
+    # Whole-turn retention keeps at least the newest turn unconditionally, so a
+    # single huge recent tool result can hold the payload above the ceiling no
+    # matter how much old history was dropped. An over-ceiling payload is what
+    # makes routers like Atria stall and push the request back down the chain,
+    # so truncate the largest contents until the payload actually fits.
+    def _truncate_text(text, keep):
+        if len(text) <= keep:
+            return text
+        head = keep * 2 // 3
+        marker = f"\n[... Claude Bridge truncated {len(text) - keep:,} chars to fit the router payload limit ...]\n"
+        return text[:head] + marker + text[len(text) - (keep - head):]
+
+    for _ in range(30):  # halving loop; 1MB over budget resolves in a few passes
+        try:
+            total = len(json.dumps(system_msgs + notice_msgs + flattened).encode("utf-8"))
+        except Exception:
+            break
+        if total <= max_bytes:
+            break
+        biggest, biggest_bytes = None, 0
+        for m in flattened:
+            try:
+                s = len(json.dumps(m).encode("utf-8"))
+            except Exception:
+                continue
+            if s > biggest_bytes:
+                biggest, biggest_bytes = m, s
+        if biggest is None or biggest_bytes < 400:
+            break
+        content = biggest.get("content")
+        if isinstance(content, str):
+            biggest["content"] = _truncate_text(biggest["content"], max(200, len(content) // 2))
+        elif isinstance(content, list):
+            block, block_len = None, 0
+            for b in content:
+                if isinstance(b, dict) and isinstance(b.get("text"), str) and len(b["text"]) > block_len:
+                    block, block_len = b, len(b["text"])
+            if block is not None:
+                block["text"] = _truncate_text(block["text"], max(200, block_len // 2))
+            else:
+                break
+
     return system_msgs + notice_msgs + flattened
 
 
@@ -985,7 +1128,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _handle_anthropic_native(self, anthropic_req, target_model, router_url, api_key, cfg,
-                                allow_fallback=False, fallback_cfg=None, fallback_name="", tb=None):
+                                allow_fallback=False, fallback_cfg=None, fallback_name="", tb=None,
+                                target_effort=""):
         """
         Directly routes requests to Anthropic-compatible providers (like AgentRouter)
         using the official anthropic SDK client, which complies with Aliyun WAF TLS
@@ -995,7 +1139,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if not base_url.startswith("http"):
             base_url = f"https://{base_url}"
 
-        self.emit_log(f"Claude Request -> {target_model} via {base_url} (Anthropic-Native)")
+        self.emit_log(f"Claude Request -> {target_model} via {base_url} (Anthropic-Native)"
+                      + (f" (effort: {target_effort})" if target_effort else ""))
 
         default_model = cfg.get("model", target_model).strip()
         api_keys = parse_api_keys(api_key)
@@ -1031,6 +1176,15 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
         if thinking_mode != "strip" and "thinking" in anthropic_req and anthropic_req["thinking"] is not None:
             clean_req["thinking"] = anthropic_req["thinking"]
+
+        # Per-model effort from the bridge UI. Claude Code no longer exposes
+        # this for custom endpoints, so the bridge is the only place it can be
+        # set. Anthropic-native routers take it in output_config.
+        if target_effort:
+            clean_req["output_config"] = {
+                **(anthropic_req.get("output_config") or {}),
+                "effort": target_effort,
+            }
 
         def _execute_streaming(req_dict):
             nonlocal client, current_key
@@ -1185,6 +1339,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     new_req.pop("thinking", None)
                     return _execute_streaming(new_req)
 
+                if status == 400 and "output_config" in req_dict and (
+                    "output_config" in err_lower or "effort" in err_lower
+                ):
+                    self.emit_log("Model does not support effort param; retrying without it...")
+                    new_req = dict(req_dict)
+                    oc = dict(new_req.get("output_config") or {})
+                    oc.pop("effort", None)
+                    if oc:
+                        new_req["output_config"] = oc
+                    else:
+                        new_req.pop("output_config", None)
+                    return _execute_streaming(new_req)
+
                 # Fallback on 429/402 to next key in pool
                 if status in (429, 402) and multi_key_enabled:
                     tried_keys.add(current_key)
@@ -1247,7 +1414,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         f"Router unreachable ({type(ex).__name__}: {ex}); "
                         f"failing over to [{fallback_name}]...")
                     return self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
-                self.emit_log(f"Proxy Connection Error: {str(ex)}")
+                self.emit_log(f"Proxy Connection Error: {_describe(ex)}")
                 try:
                     payload = json.dumps({"error": str(ex)}).encode("utf-8")
                     self.send_response(504)
@@ -1266,7 +1433,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         stream_in, stream_out,
                     )
                     return
-                self.emit_log(f"Proxy Connection Error: {str(ex)}")
+                self.emit_log(f"Proxy Connection Error: {_describe(ex)}")
                 try:
                     payload = json.dumps({"error": str(ex)}).encode("utf-8")
                     self.send_response(500)
@@ -1317,6 +1484,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     new_req.pop("thinking", None)
                     return _execute_non_streaming(new_req)
 
+                if status == 400 and "output_config" in req_dict and (
+                    "output_config" in err_lower or "effort" in err_lower
+                ):
+                    self.emit_log("Model does not support effort param; retrying without it...")
+                    new_req = dict(req_dict)
+                    oc = dict(new_req.get("output_config") or {})
+                    oc.pop("effort", None)
+                    if oc:
+                        new_req["output_config"] = oc
+                    else:
+                        new_req.pop("output_config", None)
+                    return _execute_non_streaming(new_req)
+
                 # Fallback on 429/402 to next key in pool
                 if status in (429, 402) and multi_key_enabled:
                     tried_keys.add(current_key)
@@ -1360,7 +1540,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         f"Router unreachable ({type(ex).__name__}: {ex}); "
                         f"failing over to [{fallback_name}]...")
                     return self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
-                self.emit_log(f"Proxy Connection Error: {str(ex)}")
+                self.emit_log(f"Proxy Connection Error: {_describe(ex)}")
                 payload = json.dumps({"error": str(ex)}).encode("utf-8")
                 self.send_response(504)
                 self.send_header("Content-Type", "application/json")
@@ -1369,7 +1549,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
             except Exception as ex:
-                self.emit_log(f"Proxy Connection Error: {str(ex)}")
+                self.emit_log(f"Proxy Connection Error: {_describe(ex)}")
                 payload = json.dumps({"error": str(ex)}).encode("utf-8")
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
@@ -1576,31 +1756,50 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         router_url = active_cfg.get("router_url", "https://inference.dahl.global/v1").rstrip("/")
         api_key = active_cfg.get("api_key", "").strip()
         
-        # Multi-model resolution
+        # Multi-model resolution. The effort slot follows the resolved model so
+        # each dropdown model can carry its own reasoning level.
         default_model = active_cfg.get("model", "deepseek-ai/DeepSeek-V4-Flash-0731").strip()
         sonnet_model = active_cfg.get("sonnet_model", default_model).strip()
         opus_model = active_cfg.get("opus_model", "MiniMaxAI/MiniMax-M2.7").strip()
         haiku_model = active_cfg.get("haiku_model", "zai-org/GLM-5.3-Flash").strip()
 
+        target_effort = ""
         if "opus" in req_model and opus_model:
             target_model = opus_model
+            target_effort = active_cfg.get("opus_effort", "")
         elif "haiku" in req_model and haiku_model:
             target_model = haiku_model
+            target_effort = active_cfg.get("haiku_effort", "")
         elif "sonnet" in req_model and sonnet_model:
             target_model = sonnet_model
+            target_effort = active_cfg.get("sonnet_effort", "")
+        elif anthropic_req.get("model") == default_model:
+            target_model = default_model
+            target_effort = active_cfg.get("model_effort", "")
         elif anthropic_req.get("model") and any(
-            anthropic_req.get("model") == m for m in (default_model, sonnet_model, opus_model, haiku_model) if m
+            anthropic_req.get("model") == m for m in (sonnet_model, opus_model, haiku_model) if m
         ):
             target_model = anthropic_req.get("model")
+            for slot_model, slot_key in (
+                (opus_model, "opus_effort"),
+                (haiku_model, "haiku_effort"),
+                (sonnet_model, "sonnet_effort"),
+            ):
+                if target_model == slot_model:
+                    target_effort = active_cfg.get(slot_key, "")
+                    break
         else:
             target_model = default_model or sonnet_model
+            target_effort = active_cfg.get("model_effort", "")
+        target_effort = (target_effort or "").strip().lower()
         
         # Check if router uses Anthropic-native protocol (e.g. AgentRouter)
         is_anthropic_native = ("agentrouter" in router_url.lower()) or ("anthropic.com" in router_url.lower()) or (active_cfg.get("protocol") == "anthropic")
         if is_anthropic_native:
             self._handle_anthropic_native(anthropic_req, target_model, router_url, api_key, active_cfg,
                                           allow_fallback=allow_fallback, fallback_cfg=fallback_cfg,
-                                          fallback_name=fallback_name, tb=tb)
+                                          fallback_name=fallback_name, tb=tb,
+                                          target_effort=target_effort)
             return
 
         # Build target OpenAI endpoint
@@ -1610,6 +1809,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         openai_req = convert_anthropic_to_openai(anthropic_req, target_model,
                                                  auto_save_images=auto_save_images,
                                                  strip_images=strip_images)
+        if target_effort:
+            # OpenAI-standard reasoning knob; OpenRouter-style routers (Token
+            # Juice included) accept it. Retried without it below if this
+            # router rejects the field.
+            openai_req["reasoning_effort"] = target_effort
 
         # Check payload size for routers with request body limits (e.g. Atria TokenPlan 850KB ceiling)
         is_atria = ("atria" in router_url.lower()) or ("atria" in (target_model or "").lower())
@@ -1621,13 +1825,21 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if original_bytes > safe_ceiling:
             self.emit_log(f"Request payload ({original_bytes:,} bytes) exceeds safe ceiling ({safe_ceiling:,} bytes). Compacting earlier context...")
             openai_req["messages"] = trim_openai_messages(openai_req.get("messages", []), max_bytes=safe_ceiling)
+            new_bytes = 0
             try:
                 new_bytes = len(json.dumps(openai_req).encode("utf-8"))
                 self.emit_log(f"Context compacted: {original_bytes:,} -> {new_bytes:,} bytes")
             except Exception:
                 pass
+            if new_bytes > safe_ceiling and allow_fallback and fallback_cfg:
+                # Compaction bottomed out (single turn larger than the
+                # ceiling). Sending it anyway stalls this router; hop the chain
+                # instead and let a provider with a bigger window take it.
+                self.emit_log(f"Compacted payload ({new_bytes:,} bytes) still exceeds this router's ceiling. Skipping ahead...")
+                return self._failover_request(anthropic_req, fallback_cfg, tb=tb, fallback_name=fallback_name)
 
-        self.emit_log(f"Claude Request -> {target_model} via {router_url}")
+        self.emit_log(f"Claude Request -> {target_model} via {router_url}"
+                      + (f" (effort: {target_effort})" if target_effort else ""))
         
         api_keys = parse_api_keys(api_key)
         multi_key_enabled = active_cfg.get("multi_key_rotation", True)
@@ -1709,11 +1921,34 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         # Some OpenAI-style routers (e.g. Dahl) reject inline
                         # image_url parts with a 400. Strip to paths and retry once.
                         is_img_err = (resp.status_code == 400 and "image" in err_body.lower()
+                                      and openai_req_has_image(openai_req)
                                       and not router_rejects_inline_images(router_url))
+                        is_effort_err = (resp.status_code == 400 and "reasoning_effort" in openai_req
+                                         and "effort" in err_body.lower())
                         if is_img_err:
                             mark_router_rejects_inline_images(router_url)
                             self.emit_log(f"Router rejected inline images ({resp.status_code}). Retrying with images as file paths; future requests will skip inline images for this router.")
                             openai_req = strip_inline_images(openai_req)
+                            try:
+                                resp.close()
+                            except Exception:
+                                pass
+                            retry_ctx = client.stream("POST", endpoint, headers=req_headers, json=openai_req, timeout=_stream_timeout())
+                            retry_resp = retry_ctx.__enter__()
+                            if retry_resp.status_code == 200:
+                                resp = retry_resp
+                            else:
+                                try:
+                                    err_body = retry_resp.read().decode("utf-8", errors="replace")
+                                except Exception:
+                                    err_body = ""
+                                try:
+                                    retry_ctx.__exit__(None, None, None)
+                                except Exception:
+                                    pass
+                        elif is_effort_err:
+                            self.emit_log(f"Router rejected reasoning_effort ({resp.status_code}). Retrying without it...")
+                            openai_req.pop("reasoning_effort", None)
                             try:
                                 resp.close()
                             except Exception:
@@ -2111,11 +2346,18 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     is_size_err = ("not supported by TokenPlan" in err_body or resp.status_code == 413 or "too large" in err_body.lower())
                     # Inline-image rejection: strip to paths and retry once.
                     is_img_err = (resp.status_code == 400 and "image" in err_body.lower()
+                                  and openai_req_has_image(openai_req)
                                   and not router_rejects_inline_images(router_url))
+                    is_effort_err = (resp.status_code == 400 and "reasoning_effort" in openai_req
+                                     and "effort" in err_body.lower())
                     if is_img_err:
                         mark_router_rejects_inline_images(router_url)
                         self.emit_log(f"Router rejected inline images ({resp.status_code}). Retrying with images as file paths; future requests will skip inline images for this router.")
                         openai_req = strip_inline_images(openai_req)
+                        resp = client.post(endpoint, headers=req_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
+                    elif is_effort_err:
+                        self.emit_log(f"Router rejected reasoning_effort ({resp.status_code}). Retrying without it...")
+                        openai_req.pop("reasoning_effort", None)
                         resp = client.post(endpoint, headers=req_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
                     elif is_size_err and len(openai_req.get("messages", [])) > 2:
                         self.emit_log(f"Router rejected non-streaming payload ({resp.status_code}): TokenPlan limit reached. Rescuing with compacted context...")
@@ -2233,7 +2475,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     f"failing over to [{fallback_name}]...")
                 self._failover_request(anthropic_req, fallback_cfg, tb, fallback_name)
                 return
-            self.emit_log(f"Proxy Connection Error: {str(ex)}")
+            self.emit_log(f"Proxy Connection Error: {_describe(ex)}")
             try:
                 payload = json.dumps({"error": str(ex)}).encode("utf-8")
                 self.send_response(504)
@@ -2255,7 +2497,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     stream_in, stream_out,
                 )
                 return
-            self.emit_log(f"Proxy Connection Error: {str(ex)}")
+            self.emit_log(f"Proxy Connection Error: {_describe(ex)}")
             try:
                 payload = json.dumps({"error": str(ex)}).encode("utf-8")
                 self.send_response(500)
@@ -2318,7 +2560,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             cfg = self.config_getter() if self.config_getter else {}
             self._handle_messages(anthropic_req, cfg)
         except Exception as ex:
-            self.emit_log(f"Proxy Connection Error: {str(ex)}")
+            self.emit_log(f"Proxy Connection Error: {_describe(ex)}")
             try:
                 payload = json.dumps({"error": str(ex)}).encode("utf-8")
                 self.send_response(500)

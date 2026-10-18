@@ -36,7 +36,23 @@ from proxy_engine import (
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.5"
+
+# Per-model reasoning effort. Claude Code no longer exposes this for custom
+# models, so the bridge injects it upstream: reasoning_effort on OpenAI-style
+# routers, output_config.effort on Anthropic-native ones. "Default" = omit.
+# Levels match what routers actually accept (Token Juice rejects "medium").
+EFFORT_LEVELS = ["Default", "None", "Low", "High", "Max"]
+EFFORT_KEYS = {"None": "none", "Low": "low", "High": "high", "Max": "max"}
+EFFORT_LABELS = {v: k for k, v in EFFORT_KEYS.items()}
+
+
+def effort_key(label):
+    return EFFORT_KEYS.get(label, "")
+
+
+def effort_label(value):
+    return EFFORT_LABELS.get((value or "").strip().lower(), "Default")
 
 # Configuration paths
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ClaudeBridge")
@@ -201,7 +217,7 @@ class ClaudeBridgeApp:
         self.root = root
         self.root.title(f"Claude Bridge v{APP_VERSION} — Multi-Provider Router Proxy")
         self.root.geometry("1200x760")
-        self.root.minsize(1040, 640)
+        self.root.minsize(870, 600)
         self.root.configure(bg="#18181b")
 
         # Set window icon and taskbar icon
@@ -348,16 +364,18 @@ class ClaudeBridgeApp:
         self.quit_btn.pack(side="right")
 
         # ---- Two-column body --------------------------------------------
-        # Balanced split; both columns expand to fill space and attach naturally
-        body = tk.Frame(main_frame, bg="#18181b")
+        # Settings side is fixed/uncontracted; log side absorbs resizing and
+        # can contract as much as possible down to a usable limit. A draggable
+        # divider also allows manual adjustment within the same safety limits.
+        body = tk.PanedWindow(
+            main_frame, orient="horizontal", bg="#18181b", bd=0,
+            sashwidth=6, sashpad=1, sashrelief="flat", sashcursor="size_we", opaqueresize=True
+        )
         body.pack(fill="both", expand=True, padx=16, pady=(0, 8))
-        body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=1)
-        body.rowconfigure(0, weight=1)
 
-        # LEFT: scrollable configuration column
-        left_pane = tk.Frame(body, bg="#18181b")
-        canvas = tk.Canvas(left_pane, bg="#18181b", highlightthickness=0, bd=0)
+        # LEFT: scrollable configuration column (uncontracted, fixed comfortable width)
+        left_pane = tk.Frame(body, bg="#18181b", width=530)
+        canvas = tk.Canvas(left_pane, bg="#18181b", highlightthickness=0, bd=0, width=514)
         vbar = ttk.Scrollbar(left_pane, orient="vertical", command=canvas.yview)
 
         def _on_yscroll(lo, hi):
@@ -398,7 +416,7 @@ class ClaudeBridgeApp:
         canvas.bind_all("<MouseWheel>", _wheel)
 
         canvas.pack(side="left", fill="both", expand=True)
-        left_pane.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        body.add(left_pane, minsize=530, stretch="never")
 
         card = cfg_inner  # keep the rest of the builder readable
 
@@ -524,6 +542,12 @@ class ClaudeBridgeApp:
         )
         self.model_entry.pack(fill="x", pady=(2, 0), ipady=4)
 
+        eff_row = tk.Frame(m_col, bg="#1e1e24")
+        eff_row.pack(fill="x", pady=(2, 0))
+        ttk.Label(eff_row, text="Reasoning effort:", style="FieldLabel.TLabel").pack(side="left")
+        self.model_effort_var = tk.StringVar(value=effort_label(cur_p_data.get("model_effort", "")))
+        self._effort_combo(eff_row, self.model_effort_var).pack(side="left", padx=(6, 0))
+
         p_col = tk.Frame(row_frame, bg="#1e1e24")
         p_col.pack(side="right", padx=(6, 0))
         ttk.Label(p_col, text="Local Port:", style="FieldLabel.TLabel").pack(anchor="w")
@@ -544,18 +568,24 @@ class ClaudeBridgeApp:
         s_row.pack(fill="x", pady=2)
         tk.Label(s_row, text="Sonnet →", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
         self.sonnet_var = tk.StringVar(value=cur_p_data.get("sonnet_model", "deepseek-ai/DeepSeek-V4-Flash-0731"))
+        self.sonnet_effort_var = tk.StringVar(value=effort_label(cur_p_data.get("sonnet_effort", "")))
+        self._effort_combo(s_row, self.sonnet_effort_var).pack(side="right", padx=(4, 0))
         tk.Entry(s_row, textvariable=self.sonnet_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
 
         o_row = tk.Frame(mapping_frame, bg="#1e1e24")
         o_row.pack(fill="x", pady=2)
         tk.Label(o_row, text="Opus →", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
         self.opus_var = tk.StringVar(value=cur_p_data.get("opus_model", "MiniMaxAI/MiniMax-M2.7"))
+        self.opus_effort_var = tk.StringVar(value=effort_label(cur_p_data.get("opus_effort", "")))
+        self._effort_combo(o_row, self.opus_effort_var).pack(side="right", padx=(4, 0))
         tk.Entry(o_row, textvariable=self.opus_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
 
         h_row = tk.Frame(mapping_frame, bg="#1e1e24")
         h_row.pack(fill="x", pady=2)
         tk.Label(h_row, text="Haiku →", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
         self.haiku_var = tk.StringVar(value=cur_p_data.get("haiku_model", "zai-org/GLM-5.3-Flash"))
+        self.haiku_effort_var = tk.StringVar(value=effort_label(cur_p_data.get("haiku_effort", "")))
+        self._effort_combo(h_row, self.haiku_effort_var).pack(side="right", padx=(4, 0))
         tk.Entry(h_row, textvariable=self.haiku_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
 
         # --- Hybrid Multi-Router ---
@@ -727,7 +757,7 @@ class ClaudeBridgeApp:
             boot_tray_check.configure(state="disabled")
         boot_tray_check.pack(anchor="w")
 
-        # RIGHT: live log column (always visible, gets the space)
+        # RIGHT: live log column (absorbs extra space, can contract down to limit)
         right_pane = tk.Frame(body, bg="#27272a", padx=12, pady=10, highlightbackground="#3f3f46", highlightthickness=1)
 
         log_head = tk.Frame(right_pane, bg="#27272a")
@@ -735,15 +765,12 @@ class ClaudeBridgeApp:
 
         tk.Label(log_head, text="Activity Log", font=("Segoe UI", 10, "bold"), bg="#27272a", fg="#60a5fa").pack(side="left")
 
-        self.log_status_lbl = tk.Label(log_head, text="", font=("Segoe UI", 8), bg="#27272a", fg="#71717a")
-        self.log_status_lbl.pack(side="right")
-
         clear_btn = tk.Button(
             log_head, text="Clear", command=self.clear_log,
             bg="#3f3f46", fg="#a1a1aa", activebackground="#52525b", activeforeground="#ffffff",
             relief="flat", font=("Segoe UI", 8), padx=8, pady=1, cursor="hand2"
         )
-        clear_btn.pack(side="right", padx=(0, 8))
+        clear_btn.pack(side="right")
 
         # Auto-scroll: follow the newest line unless the user is reading back.
         self.auto_scroll_var = tk.BooleanVar(value=True)
@@ -752,6 +779,9 @@ class ClaudeBridgeApp:
             bg="#27272a", fg="#a1a1aa", activebackground="#27272a", selectcolor="#18181b",
             relief="flat", font=("Segoe UI", 8)
         ).pack(side="right", padx=(0, 8))
+
+        self.log_status_lbl = tk.Label(log_head, text="", font=("Segoe UI", 8), bg="#27272a", fg="#71717a", anchor="e")
+        self.log_status_lbl.pack(side="right", padx=(0, 8), fill="x", expand=True)
 
         self.log_area = scrolledtext.ScrolledText(
             right_pane, wrap="word", font=("Consolas", 9),
@@ -764,11 +794,18 @@ class ClaudeBridgeApp:
         self.log_area.tag_configure("route", foreground="#60a5fa")
         self.log_area.pack(fill="both", expand=True)
         self.log_area.configure(state="disabled")
-        right_pane.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        body.add(right_pane, minsize=300, stretch="always")
 
         # Token counter bar under the log
         token_frame = tk.Frame(right_pane, bg="#27272a")
         token_frame.pack(fill="x", pady=(6, 0))
+
+        reset_tokens_btn = tk.Button(
+            token_frame, text="↺ Reset", command=self.reset_token_counter,
+            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", activebackground="#52525b",
+            activeforeground="#ffffff", relief="flat", padx=8, pady=2, cursor="hand2"
+        )
+        reset_tokens_btn.pack(side="right")
 
         tk.Label(
             token_frame, text="Tokens:", font=("Segoe UI", 9, "bold"), bg="#27272a", fg="#60a5fa"
@@ -779,13 +816,6 @@ class ClaudeBridgeApp:
             bg="#27272a", fg="#d4d4d8"
         )
         self.token_display.pack(side="left")
-
-        reset_tokens_btn = tk.Button(
-            token_frame, text="↺ Reset", command=self.reset_token_counter,
-            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", activebackground="#52525b",
-            activeforeground="#ffffff", relief="flat", padx=8, pady=2, cursor="hand2"
-        )
-        reset_tokens_btn.pack(side="right")
 
         # Live API-key rotation view: one row per router, ● marks the key the
         # next request will use and the count shows how the load is spread.
@@ -872,6 +902,10 @@ class ClaudeBridgeApp:
         self.sonnet_var.set(p_data.get("sonnet_model", p_data.get("model", "")))
         self.opus_var.set(p_data.get("opus_model", p_data.get("model", "")))
         self.haiku_var.set(p_data.get("haiku_model", p_data.get("model", "")))
+        self.model_effort_var.set(effort_label(p_data.get("model_effort", "")))
+        self.sonnet_effort_var.set(effort_label(p_data.get("sonnet_effort", "")))
+        self.opus_effort_var.set(effort_label(p_data.get("opus_effort", "")))
+        self.haiku_effort_var.set(effort_label(p_data.get("haiku_effort", "")))
 
         # Legacy hybrid profiles carry their routing setup inside the profile
         # (is_hybrid/primary_provider/secondary_provider). Mirror it into the
@@ -943,6 +977,33 @@ class ClaudeBridgeApp:
         )
         self.log(f"Context window for {model}: {length:,} tokens")
 
+    def _effort_combo(self, parent, var, width=8):
+        cb = ttk.Combobox(
+            parent, textvariable=var, values=EFFORT_LEVELS,
+            state="readonly", width=width, font=("Segoe UI", 8)
+        )
+        cb.bind("<<ComboboxSelected>>", self._on_effort_changed)
+        return cb
+
+    def _on_effort_changed(self, event=None):
+        """Persist + log on change. The running proxy reads these vars live via
+        get_current_config(), so no restart is needed -- only the Mappings line
+        printed at start-up is a snapshot."""
+        p_name = self.provider_var.get().strip()
+        if p_name and p_name in self.cfg.get("providers", {}):
+            self.cfg["providers"][p_name].update({
+                "model_effort": effort_key(self.model_effort_var.get()),
+                "sonnet_effort": effort_key(self.sonnet_effort_var.get()),
+                "opus_effort": effort_key(self.opus_effort_var.get()),
+                "haiku_effort": effort_key(self.haiku_effort_var.get()),
+            })
+            save_config(self.cfg)
+        self.log(
+            f"Effort set: Custom={self.model_effort_var.get()}, "
+            f"Sonnet={self.sonnet_effort_var.get()}, Opus={self.opus_effort_var.get()}, "
+            f"Haiku={self.haiku_effort_var.get()} (applies to next request, no restart)"
+        )
+
     def _get_thinking_mode_key(self):
         val = self.thinking_mode_var.get()
         if "Strip" in val:
@@ -974,6 +1035,10 @@ class ClaudeBridgeApp:
             "sonnet_model": self.sonnet_var.get().strip(),
             "opus_model": self.opus_var.get().strip(),
             "haiku_model": self.haiku_var.get().strip(),
+            "model_effort": effort_key(self.model_effort_var.get()),
+            "sonnet_effort": effort_key(self.sonnet_effort_var.get()),
+            "opus_effort": effort_key(self.opus_effort_var.get()),
+            "haiku_effort": effort_key(self.haiku_effort_var.get()),
             "egress_proxy": self.proxy_url_var.get().strip() if hasattr(self, "proxy_url_var") else self.cfg["providers"].get(p_name, {}).get("egress_proxy", "")
         })
         self.cfg["providers"][p_name] = merged
@@ -1025,7 +1090,11 @@ class ClaudeBridgeApp:
             "model": self.model_var.get().strip(),
             "sonnet_model": self.sonnet_var.get().strip(),
             "opus_model": self.opus_var.get().strip(),
-            "haiku_model": self.haiku_var.get().strip()
+            "haiku_model": self.haiku_var.get().strip(),
+            "model_effort": effort_key(self.model_effort_var.get()),
+            "sonnet_effort": effort_key(self.sonnet_effort_var.get()),
+            "opus_effort": effort_key(self.opus_effort_var.get()),
+            "haiku_effort": effort_key(self.haiku_effort_var.get())
         }
         self.cfg["active_provider"] = name
         save_config(self.cfg)
@@ -1332,6 +1401,10 @@ class ClaudeBridgeApp:
             "sonnet_model": self.sonnet_var.get().strip(),
             "opus_model": self.opus_var.get().strip(),
             "haiku_model": self.haiku_var.get().strip(),
+            "model_effort": effort_key(self.model_effort_var.get()),
+            "sonnet_effort": effort_key(self.sonnet_effort_var.get()),
+            "opus_effort": effort_key(self.opus_effort_var.get()),
+            "haiku_effort": effort_key(self.haiku_effort_var.get()),
             "port": self.port_var.get(),
             "minimize_to_tray": self.min_on_close_var.get(),
             "auto_start": self.auto_start_var.get(),
@@ -1339,6 +1412,12 @@ class ClaudeBridgeApp:
             "context_length": self.get_context_length(),
             "auto_compact_window": self.auto_ctx_var.get(),
             "strip_images": self.strip_images_var.get(),
+            # The engine reads the egress proxy off the top-level cfg when the
+            # hybrid router is off (or its chain resolves empty) and falls back
+            # to `dict(cfg)` -- without this key the proxy configured on the
+            # provider is silently dropped and every request goes out on the
+            # raw IP the proxy exists to hide.
+            "egress_proxy": self.proxy_url_var.get().strip() if hasattr(self, "proxy_url_var") else "",
             # Hybrid routing: the engine reads `all_providers` to resolve the
             # chain by name. Without these keys it silently stays single-router
             # and never fails over.
@@ -1366,7 +1445,11 @@ class ClaudeBridgeApp:
                 "model": cfg["model"],
                 "sonnet_model": cfg["sonnet_model"],
                 "opus_model": cfg["opus_model"],
-                "haiku_model": cfg["haiku_model"]
+                "haiku_model": cfg["haiku_model"],
+                "model_effort": cfg["model_effort"],
+                "sonnet_effort": cfg["sonnet_effort"],
+                "opus_effort": cfg["opus_effort"],
+                "haiku_effort": cfg["haiku_effort"]
             })
             self.cfg["active_provider"] = p_name
             save_config(self.cfg)
@@ -1392,7 +1475,7 @@ class ClaudeBridgeApp:
                 )
             else:
                 self.log(f"Active Provider: [{p_name}] -> {cfg['router_url']}")
-            self.log(f"Mappings: Sonnet->{cfg['sonnet_model']}, Opus->{cfg['opus_model']}, Haiku->{cfg['haiku_model']}")
+            self.log(f"Mappings: Sonnet->{cfg['sonnet_model']} ({cfg['sonnet_effort'] or 'default effort'}), Opus->{cfg['opus_model']} ({cfg['opus_effort'] or 'default effort'}), Haiku->{cfg['haiku_model']} ({cfg['haiku_effort'] or 'default effort'}), Custom->{cfg['model']} ({cfg['model_effort'] or 'default effort'})")
             self._update_tray_menu(is_running=True)
 
         except Exception as e:
