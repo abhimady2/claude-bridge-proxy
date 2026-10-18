@@ -36,7 +36,7 @@ from proxy_engine import (
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.4.6"
 
 # Per-model reasoning effort. Claude Code no longer exposes this for custom
 # models, so the bridge injects it upstream: reasoning_effort on OpenAI-style
@@ -94,8 +94,7 @@ def get_default_providers():
             "model": "Atria-Dawn-Preview",
             "sonnet_model": "Atria-Dawn-Preview",
             "opus_model": "Atria-Dawn-Preview",
-            "haiku_model": "Atria-Dawn-Preview",
-            "context_length": 128000
+            "haiku_model": "Atria-Dawn-Preview"
         },
         "Agent Router": {
             "router_url": "https://agentrouter.org",
@@ -1526,14 +1525,20 @@ class ClaudeBridgeApp:
             settings["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] = cfg["sonnet_model"]
             settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = cfg["haiku_model"]
 
-            # Auto-compact: CLAUDE_CODE_MAX_CONTEXT_TOKENS is only honored when
-            # DISABLE_COMPACT is set, and it only raises the *ceiling* — Claude Code
-            # still won't trigger compaction on its own. The two keys that actually
-            # make it compact at this limit are autoCompactWindow (threshold) and
-            # CLAUDE_CODE_AUTO_COMPACT_WINDOW (same value as env override).
+            # Auto-compact: for an unrecognized non-claude-* model ID (this
+            # proxy's usual target) CLAUDE_CODE_MAX_CONTEXT_TOKENS sets the
+            # assumed window directly. AUTO_COMPACT_WINDOW is the highest-
+            # precedence threshold and is capped at that model window.
             context_length = cfg["context_length"]
             settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(context_length)
             settings["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(context_length)
+            # A [1m] model alias makes Claude Code assume a 1M window and ignore
+            # MAX_CONTEXT_TOKENS; disable that assumption when the user's
+            # verified window is smaller.
+            if context_length < 1_000_000:
+                settings["env"]["CLAUDE_CODE_DISABLE_1M_CONTEXT"] = "1"
+            else:
+                settings["env"].pop("CLAUDE_CODE_DISABLE_1M_CONTEXT", None)
             # This proxy rewrites Anthropic<->OpenAI traffic, which strips the
             # safeguards request/response fields the auto-mode classifier needs,
             # so Claude Code falls back to its own billed classifier requests.
@@ -1589,7 +1594,7 @@ class ClaudeBridgeApp:
                             "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                             "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-                            "CLAUDE_CODE_AUTO_MODE_SERVER",
+                            "CLAUDE_CODE_DISABLE_1M_CONTEXT", "CLAUDE_CODE_AUTO_MODE_SERVER",
                         ):
                             settings["env"].pop(k, None)
                     settings.pop("autoCompactWindow", None)

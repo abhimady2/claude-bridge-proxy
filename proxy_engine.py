@@ -557,34 +557,19 @@ def reset_token_stats():
 
 
 # --- Context window resolution ------------------------------------------------
-# Only some routers (OpenRouter) report context_length in /v1/models. The others
-# return a bare id list, so a static table is the source of truth for them and
-# DEFAULT_CONTEXT_LENGTH is the editable last resort.
+# The user-supplied context length is the source of truth. Only routers that
+# expose context_length in /v1/models can inform Auto-detect; no provider's
+# window is hardcoded here.
 DEFAULT_CONTEXT_LENGTH = 256000
 
-# ponytail: hardcoded for models the routers won't describe. Wrong numbers here
-# are worse than the default, so this only holds values verified against the
-# vendor's own docs; anything uncertain falls through to the fetch/default.
-# Note: Atria-Dawn-Preview advertises 256k, but its TokenPlan gateway enforces an ~875KB
-# request payload ceiling (~130k-140k tokens). Setting 128k ensures Claude Code compacts
-# at ~83k tokens before approaching the gateway body limit.
-KNOWN_CONTEXT_LENGTHS = (
-    ("atria", 128000),
-    ("claude-", 200000),
-)
+# Rough bytes-per-token for JSON-encoded chat messages. Used only to turn the
+# configured context length into a request-body guard; 8 leaves headroom for
+# JSON overhead and inline images, so the guard does not trim below the real
+# token budget.
+APPROX_BYTES_PER_TOKEN = 8
 
 _context_cache = {}
 _context_cache_lock = threading.Lock()
-
-
-def _lookup_known_context(model):
-    m = (model or "").strip().lower()
-    if not m:
-        return None
-    for prefix, length in KNOWN_CONTEXT_LENGTHS:
-        if prefix in m:
-            return length
-    return None
 
 
 def fetch_context_length(router_url, api_key, model, timeout=8.0):
@@ -602,48 +587,45 @@ def fetch_context_length(router_url, api_key, model, timeout=8.0):
         if table is not None and wanted in table:
             return table[wanted]
 
-    resolved = _lookup_known_context(model)
-    if resolved is None:
-        # Ask the router. Most return no context_length; 401/404/timeout just
-        # fall through to the default. The whole model table is fetched once
-        # per router: after that, unknown models resolve to the default from
-        # the cache instead of each paying their own round-trip.
-        try:
-            with _context_cache_lock:
-                already_probed = _context_cache.get(router_url, {}).get("__probed__", False)
-            if not already_probed:
-                base = router_url.rstrip("/")
-                if not base.endswith("/models"):
-                    base = f"{base}/models"
-                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-                resp = _get_client().get(base, headers=headers, timeout=timeout)
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    items = payload.get("data") or payload.get("models") or []
-                    fetched = {"__probed__": True}
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        length = item.get("context_length") or item.get("max_context_length")
-                        if isinstance(length, int) and length > 0:
-                            fetched[(item.get("id") or "").strip().lower()] = length
-                    with _context_cache_lock:
-                        _context_cache.setdefault(router_url, {}).update(fetched)
-                else:
-                    with _context_cache_lock:
-                        _context_cache.setdefault(router_url, {})["__probed__"] = True
-        except Exception:
-            resolved = None
-            # Router unreachable: remember the probe failed so /v1/models
-            # doesn't retry it for every listed model this process lifetime.
-            with _context_cache_lock:
-                _context_cache.setdefault(router_url, {})["__probed__"] = True
-
-    if not resolved:
-        resolved = DEFAULT_CONTEXT_LENGTH
+    # Ask the router. Most return no context_length; 401/404/timeout just fall
+    # through to the default. The whole model table is fetched once per router:
+    # after that, unknown models resolve to the default from the cache instead
+    # of each paying their own round-trip. A user-set value wins over this in
+    # the UI; nothing here hardcodes a provider's window.
+    try:
+        with _context_cache_lock:
+            already_probed = _context_cache.get(router_url, {}).get("__probed__", False)
+        if not already_probed:
+            base = router_url.rstrip("/")
+            if not base.endswith("/models"):
+                base = f"{base}/models"
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            resp = _get_client().get(base, headers=headers, timeout=timeout)
+            if resp.status_code == 200:
+                payload = resp.json()
+                items = payload.get("data") or payload.get("models") or []
+                fetched = {"__probed__": True}
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    length = item.get("context_length") or item.get("max_context_length")
+                    if isinstance(length, int) and length > 0:
+                        fetched[(item.get("id") or "").strip().lower()] = length
+                with _context_cache_lock:
+                    _context_cache.setdefault(router_url, {}).update(fetched)
+            else:
+                with _context_cache_lock:
+                    _context_cache.setdefault(router_url, {})["__probed__"] = True
+    except Exception:
+        # Router unreachable: remember the probe failed so /v1/models
+        # doesn't retry it for every listed model this process lifetime.
+        with _context_cache_lock:
+            _context_cache.setdefault(router_url, {})["__probed__"] = True
 
     with _context_cache_lock:
-        _context_cache.setdefault(router_url, {})[wanted] = resolved
+        table = _context_cache.setdefault(router_url, {})
+        resolved = table.get(wanted) or DEFAULT_CONTEXT_LENGTH
+        table[wanted] = resolved
     return resolved
 
 
@@ -873,7 +855,7 @@ def convert_anthropic_to_openai(anthropic_body, target_model, auto_save_images=T
     return openai_body
 
 
-def trim_openai_messages(messages, max_bytes=650000):
+def trim_openai_messages(messages, max_bytes=None):
     """
     Safely trims older messages from the middle of an OpenAI messages list
     when the total serialized JSON exceeds max_bytes.
@@ -883,6 +865,8 @@ def trim_openai_messages(messages, max_bytes=650000):
         tool_call from its matching tool responses).
       - Recent conversational turns up to the byte budget.
     """
+    if max_bytes is None:
+        max_bytes = DEFAULT_CONTEXT_LENGTH * APPROX_BYTES_PER_TOKEN
     if not messages:
         return messages
 
@@ -1815,13 +1799,20 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             # router rejects the field.
             openai_req["reasoning_effort"] = target_effort
 
-        # Check payload size for routers with request body limits (e.g. Atria TokenPlan 850KB ceiling)
-        is_atria = ("atria" in router_url.lower()) or ("atria" in (target_model or "").lower())
-        safe_ceiling = 650_000 if is_atria else 2_000_000
+        # Derive the body-size guard from the user's configured context window;
+        # no per-router ceilings.
+        context_length = cfg.get("context_length") or active_cfg.get("context_length") or DEFAULT_CONTEXT_LENGTH
+        safe_ceiling = max(1, int(context_length)) * APPROX_BYTES_PER_TOKEN
         try:
             original_bytes = len(json.dumps(openai_req).encode("utf-8"))
         except Exception:
             original_bytes = 0
+        # The upstream's prompt_tokens describes the trimmed payload. Scale it
+        # back to the original request when reporting usage to Claude Code so
+        # its autocompact gate sees the real context size and fires. The app's
+        # own token stats keep the unscaled upstream figures.
+        compaction_ratio = 1.0
+        original_token_floor = 0
         if original_bytes > safe_ceiling:
             self.emit_log(f"Request payload ({original_bytes:,} bytes) exceeds safe ceiling ({safe_ceiling:,} bytes). Compacting earlier context...")
             openai_req["messages"] = trim_openai_messages(openai_req.get("messages", []), max_bytes=safe_ceiling)
@@ -1831,6 +1822,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self.emit_log(f"Context compacted: {original_bytes:,} -> {new_bytes:,} bytes")
             except Exception:
                 pass
+            if new_bytes > 0:
+                compaction_ratio = max(1.0, original_bytes / new_bytes)
+                # Routers that report only cache-miss tokens can undercount the
+                # trimmed prompt; the byte estimate keeps the reported context
+                # honest enough to trip Claude Code's autocompact gate.
+                original_token_floor = original_bytes // APPROX_BYTES_PER_TOKEN
             if new_bytes > safe_ceiling and allow_fallback and fallback_cfg:
                 # Compaction bottomed out (single turn larger than the
                 # ceiling). Sending it anyway stalls this router; hop the chain
@@ -1968,7 +1965,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                     pass
                         elif is_size_err and len(openai_req.get("messages", [])) > 2:
                             self.emit_log(f"Router rejected payload ({resp.status_code}): TokenPlan limit reached. Rescuing with compacted context...")
-                            openai_req["messages"] = trim_openai_messages(openai_req["messages"], max_bytes=450_000)
+                            openai_req["messages"] = trim_openai_messages(openai_req["messages"], max_bytes=max(1000, safe_ceiling // 2))
                             try:
                                 resp.close()
                             except Exception:
@@ -2305,7 +2302,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             "stop_sequence": None
                         },
                         "usage": {
-                            "input_tokens": stream_in,
+                            "input_tokens": max(int(stream_in * compaction_ratio), original_token_floor),
                             "output_tokens": stream_out,
                             "cache_read_input_tokens": 0,
                             "cache_creation_input_tokens": 0
@@ -2361,7 +2358,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         resp = client.post(endpoint, headers=req_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
                     elif is_size_err and len(openai_req.get("messages", [])) > 2:
                         self.emit_log(f"Router rejected non-streaming payload ({resp.status_code}): TokenPlan limit reached. Rescuing with compacted context...")
-                        openai_req["messages"] = trim_openai_messages(openai_req["messages"], max_bytes=450_000)
+                        openai_req["messages"] = trim_openai_messages(openai_req["messages"], max_bytes=max(1000, safe_ceiling // 2))
                         resp = client.post(endpoint, headers=req_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
 
                 if resp.status_code != 200:
@@ -2437,7 +2434,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     "content": content_blocks,
                     "stop_reason": stop_reason,
                     "usage": {
-                        "input_tokens": input_tokens,
+                        "input_tokens": max(int(input_tokens * compaction_ratio), original_token_floor),
                         "output_tokens": router_usage.get("completion_tokens", 0) or 0,
                         "cache_read_input_tokens": cache_read,
                         "cache_creation_input_tokens": cache_creation
