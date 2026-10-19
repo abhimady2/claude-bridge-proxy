@@ -563,10 +563,9 @@ def reset_token_stats():
 DEFAULT_CONTEXT_LENGTH = 256000
 
 # Rough bytes-per-token for JSON-encoded chat messages. Used only to turn the
-# configured context length into a request-body guard; 8 leaves headroom for
-# JSON overhead and inline images, so the guard does not trim below the real
-# token budget.
-APPROX_BYTES_PER_TOKEN = 8
+# configured context length into a request-body guard; 16 matches the observed
+# JSON density, so the guard does not trim below the real token budget.
+APPROX_BYTES_PER_TOKEN = 16
 
 _context_cache = {}
 _context_cache_lock = threading.Lock()
@@ -967,6 +966,32 @@ def trim_openai_messages(messages, max_bytes=None):
                 break
 
     return system_msgs + notice_msgs + flattened
+
+
+def trim_request_payload(openai_req, max_total_bytes=None):
+    """Trim messages so the whole request fits max_total_bytes.
+
+    Tools/system overhead lives outside the messages list, so the budget handed
+    to trim_openai_messages excludes it. With no budget, halves the request.
+    Returns (before_bytes, after_bytes).
+    """
+    try:
+        before = len(json.dumps(openai_req).encode("utf-8"))
+        messages_bytes = len(json.dumps(openai_req.get("messages", [])).encode("utf-8"))
+    except Exception:
+        return 0, 0
+    if max_total_bytes is None:
+        max_total_bytes = max(1000, before // 2)
+    overhead = max(0, before - messages_bytes)
+    openai_req["messages"] = trim_openai_messages(
+        openai_req.get("messages", []),
+        max_bytes=max(1000, max_total_bytes - overhead),
+    )
+    try:
+        after = len(json.dumps(openai_req).encode("utf-8"))
+    except Exception:
+        after = 0
+    return before, after
 
 
 def _anthropic_text_bytes(anthropic_req):
@@ -1814,20 +1839,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         compaction_ratio = 1.0
         original_token_floor = 0
         if original_bytes > safe_ceiling:
-            self.emit_log(f"Request payload ({original_bytes:,} bytes) exceeds safe ceiling ({safe_ceiling:,} bytes). Compacting earlier context...")
-            openai_req["messages"] = trim_openai_messages(openai_req.get("messages", []), max_bytes=safe_ceiling)
-            new_bytes = 0
-            try:
-                new_bytes = len(json.dumps(openai_req).encode("utf-8"))
-                self.emit_log(f"Context compacted: {original_bytes:,} -> {new_bytes:,} bytes")
-            except Exception:
-                pass
-            if new_bytes > 0:
+            self.emit_log(f"Request payload ({original_bytes:,} bytes) exceeds body guard ({safe_ceiling:,} bytes).")
+            _, new_bytes = trim_request_payload(openai_req, safe_ceiling)
+            if 0 < new_bytes < original_bytes:
                 compaction_ratio = max(1.0, original_bytes / new_bytes)
                 # Routers that report only cache-miss tokens can undercount the
                 # trimmed prompt; the byte estimate keeps the reported context
                 # honest enough to trip Claude Code's autocompact gate.
                 original_token_floor = original_bytes // APPROX_BYTES_PER_TOKEN
+                self.emit_log(f"Context compacted: {original_bytes:,} -> {new_bytes:,} bytes")
+            else:
+                # Tools/system overhead pushed the request over the guard, or
+                # nothing in the message history could be dropped.
+                self.emit_log("No message history trimmed; sending the payload as-is.")
             if new_bytes > safe_ceiling and allow_fallback and fallback_cfg:
                 # Compaction bottomed out (single turn larger than the
                 # ceiling). Sending it anyway stalls this router; hop the chain
@@ -1964,8 +1988,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                 except Exception:
                                     pass
                         elif is_size_err and len(openai_req.get("messages", [])) > 2:
-                            self.emit_log(f"Router rejected payload ({resp.status_code}): TokenPlan limit reached. Rescuing with compacted context...")
-                            openai_req["messages"] = trim_openai_messages(openai_req["messages"], max_bytes=max(1000, safe_ceiling // 2))
+                            self.emit_log(f"Router rejected payload size ({resp.status_code}); rescuing with compacted context...")
+                            before_bytes, after_bytes = trim_request_payload(openai_req)
+                            if 0 < after_bytes < before_bytes:
+                                compaction_ratio = max(compaction_ratio, before_bytes / after_bytes)
+                                original_token_floor = max(original_token_floor, before_bytes // APPROX_BYTES_PER_TOKEN)
                             try:
                                 resp.close()
                             except Exception:
@@ -2357,8 +2384,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         openai_req.pop("reasoning_effort", None)
                         resp = client.post(endpoint, headers=req_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
                     elif is_size_err and len(openai_req.get("messages", [])) > 2:
-                        self.emit_log(f"Router rejected non-streaming payload ({resp.status_code}): TokenPlan limit reached. Rescuing with compacted context...")
-                        openai_req["messages"] = trim_openai_messages(openai_req["messages"], max_bytes=max(1000, safe_ceiling // 2))
+                        self.emit_log(f"Router rejected non-streaming payload size ({resp.status_code}); rescuing with compacted context...")
+                        before_bytes, after_bytes = trim_request_payload(openai_req)
+                        if 0 < after_bytes < before_bytes:
+                            compaction_ratio = max(compaction_ratio, before_bytes / after_bytes)
+                            original_token_floor = max(original_token_floor, before_bytes // APPROX_BYTES_PER_TOKEN)
                         resp = client.post(endpoint, headers=req_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
 
                 if resp.status_code != 200:
