@@ -366,9 +366,10 @@ class ClaudeBridgeApp:
         # Settings side is fixed/uncontracted; log side absorbs resizing and
         # can contract as much as possible down to a usable limit. A draggable
         # divider also allows manual adjustment within the same safety limits.
+        _sash_cursor = "size_we" if sys.platform == "win32" else "sb_h_double_arrow"
         body = tk.PanedWindow(
             main_frame, orient="horizontal", bg="#18181b", bd=0,
-            sashwidth=6, sashpad=1, sashrelief="flat", sashcursor="size_we", opaqueresize=True
+            sashwidth=6, sashpad=1, sashrelief="flat", sashcursor=_sash_cursor, opaqueresize=True
         )
         body.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
