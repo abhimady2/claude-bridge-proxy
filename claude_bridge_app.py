@@ -211,6 +211,77 @@ def create_tray_image(is_running=False):
     return image
 
 
+class _ColorBtn(tk.Frame):
+    """A Frame+Label composite that renders with a solid background on ALL
+    platforms including macOS dark mode.
+
+    On macOS, tk.Button completely ignores its `bg` option when the system
+    is in dark mode — the OS draws its own native button and the background
+    colour is never visible.  tk.Frame and tk.Label DO respect `bg`, so
+    wrapping a Label inside a Frame gives us full colour control.
+
+    The public API is intentionally compatible with tk.Button's .configure()
+    so that call sites (e.g. toggling the Start/Stop button colour) need zero
+    changes.
+    """
+
+    def __init__(self, parent, text="", command=None,
+                 bg="#3f3f46", fg="#ffffff", abg=None,
+                 font=("Segoe UI", 9), padx=10, pady=5,
+                 cursor="hand2", **frame_kw):
+        super().__init__(parent, bg=bg, cursor=cursor, **frame_kw)
+        self._bg  = bg
+        self._abg = abg or bg
+        self._cmd = command
+        self._lbl = tk.Label(
+            self, text=text, bg=bg, fg=fg, font=font,
+            padx=padx, pady=pady, cursor=cursor
+        )
+        self._lbl.pack(fill="both", expand=True)
+        for w in (self, self._lbl):
+            w.bind("<Button-1>", self._on_click)
+            w.bind("<Enter>",    self._on_enter)
+            w.bind("<Leave>",    self._on_leave)
+
+    # ---- event handlers ---------------------------------------------------
+    def _on_click(self, _e=None):
+        if self._cmd:
+            self._cmd()
+
+    def _on_enter(self, _e=None):
+        self._lbl.config(bg=self._abg)
+        super().configure(bg=self._abg)
+
+    def _on_leave(self, _e=None):
+        self._lbl.config(bg=self._bg)
+        super().configure(bg=self._bg)
+
+    # ---- public API -------------------------------------------------------
+    def configure(self, **kw):
+        """Intercept bg/fg/text; silently drop inapplicable tk.Button kwargs."""
+        bg   = kw.pop("bg",   None)
+        fg   = kw.pop("fg",   None)
+        text = kw.pop("text", None)
+        # Swallow Button-only kwargs that Labels/Frames don't understand
+        for _k in ("activebackground", "activeforeground",
+                   "highlightbackground", "highlightthickness",
+                   "disabledforeground", "state", "relief", "bd"):
+            kw.pop(_k, None)
+        if bg is not None:
+            self._bg = bg
+            self._lbl.config(bg=bg)
+            super().configure(bg=bg)
+        if fg is not None:
+            self._lbl.config(fg=fg)
+        if text is not None:
+            self._lbl.config(text=text)
+        if kw:
+            super().configure(**kw)
+
+    # keep configure accessible via the standard name alias
+    config = configure
+
+
 class ClaudeBridgeApp:
     def __init__(self, root):
         self.root = root
@@ -322,43 +393,38 @@ class ClaudeBridgeApp:
         toolbar = tk.Frame(main_frame, bg="#18181b")
         toolbar.pack(fill="x", padx=16, pady=(0, 6))
 
-        self.start_btn = tk.Button(
-            toolbar, text="▶  START PROXY", command=self.toggle_proxy,
-            font=("Segoe UI", 10, "bold"), bg="#10b981", fg="#ffffff",
-            activebackground="#059669", activeforeground="#ffffff",
-            relief="flat", pady=6, cursor="hand2"
+        self.start_btn = _ColorBtn(
+            toolbar, text="Start Proxy", command=self.toggle_proxy,
+            font=("Segoe UI", 10, "bold"), bg="#10b981", fg="#ffffff", abg="#059669",
+            padx=0, pady=6
         )
         self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        sync_btn = tk.Button(
-            toolbar, text="⚡ Configure Claude Code", command=self.configure_claude_settings,
-            font=("Segoe UI", 9, "bold"), bg="#3b82f6", fg="#ffffff",
-            activebackground="#2563eb", activeforeground="#ffffff",
-            relief="flat", padx=10, pady=6, cursor="hand2"
+        sync_btn = _ColorBtn(
+            toolbar, text="Configure Claude Code", command=self.configure_claude_settings,
+            font=("Segoe UI", 9, "bold"), bg="#3b82f6", fg="#ffffff", abg="#2563eb",
+            padx=10, pady=6
         )
         sync_btn.pack(side="left", padx=(0, 6))
 
-        restore_btn = tk.Button(
-            toolbar, text="🔄 Restore Original", command=self.restore_claude_settings,
-            font=("Segoe UI", 9), bg="#52525b", fg="#ffffff",
-            activebackground="#71717a", activeforeground="#ffffff",
-            relief="flat", padx=10, pady=6, cursor="hand2"
+        restore_btn = _ColorBtn(
+            toolbar, text="Restore Original", command=self.restore_claude_settings,
+            font=("Segoe UI", 9), bg="#52525b", fg="#ffffff", abg="#71717a",
+            padx=10, pady=6
         )
         restore_btn.pack(side="left", padx=(0, 6))
 
-        self.tray_btn = tk.Button(
-            toolbar, text="🗕 Minimize to Tray", command=self.minimize_to_tray,
-            font=("Segoe UI", 9), bg="#3f3f46", fg="#ffffff",
-            activebackground="#52525b", activeforeground="#ffffff",
-            relief="flat", padx=10, pady=6, cursor="hand2"
+        self.tray_btn = _ColorBtn(
+            toolbar, text="Minimize to Tray", command=self.minimize_to_tray,
+            font=("Segoe UI", 9), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            padx=10, pady=6
         )
         self.tray_btn.pack(side="left", padx=(0, 6))
 
-        self.quit_btn = tk.Button(
-            toolbar, text="✕ Close & Exit", command=self.quit_app,
-            font=("Segoe UI", 9), bg="#dc2626", fg="#ffffff",
-            activebackground="#b91c1c", activeforeground="#ffffff",
-            relief="flat", padx=10, pady=6, cursor="hand2"
+        self.quit_btn = _ColorBtn(
+            toolbar, text="Close & Exit", command=self.quit_app,
+            font=("Segoe UI", 9), bg="#dc2626", fg="#ffffff", abg="#b91c1c",
+            padx=10, pady=6
         )
         self.quit_btn.pack(side="right")
 
@@ -424,7 +490,10 @@ class ClaudeBridgeApp:
         profile_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3b82f6", highlightthickness=1)
         profile_frame.pack(fill="x", pady=(0, 8))
 
-        tk.Label(profile_frame, text="Active Provider:", font=("Segoe UI", 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(side="left", padx=(0, 8))
+        # Row 1: label + combobox
+        p_row1 = tk.Frame(profile_frame, bg="#1e1e24")
+        p_row1.pack(fill="x")
+        tk.Label(p_row1, text="Active Provider:", font=("Segoe UI", 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(side="left", padx=(0, 8))
 
         provider_names = list(self.cfg.get("providers", {}).keys())
         active_p = self.cfg.get("active_provider")
@@ -433,31 +502,35 @@ class ClaudeBridgeApp:
 
         self.provider_var = tk.StringVar(value=active_p)
         self.provider_combo = ttk.Combobox(
-            profile_frame, textvariable=self.provider_var, values=provider_names, state="readonly", width=18, font=("Segoe UI", 9)
+            p_row1, textvariable=self.provider_var, values=provider_names, state="readonly", width=22, font=("Segoe UI", 9)
         )
         self.provider_combo.pack(side="left", padx=(0, 8))
         self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_selected)
 
-        save_p_btn = tk.Button(
-            profile_frame, text="💾 Save", command=self.save_current_provider,
-            font=("Segoe UI", 8, "bold"), bg="#2563eb", fg="#ffffff", activebackground="#1d4ed8", activeforeground="#ffffff",
-            relief="flat", padx=6, pady=2, cursor="hand2"
-        )
-        save_p_btn.pack(side="left", padx=2)
+        # Row 2: action buttons always visible on their own line
+        p_row2 = tk.Frame(profile_frame, bg="#1e1e24")
+        p_row2.pack(fill="x", pady=(6, 0))
 
-        new_p_btn = tk.Button(
-            profile_frame, text="➕ New", command=self.add_new_provider,
-            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", activebackground="#52525b", activeforeground="#ffffff",
-            relief="flat", padx=6, pady=2, cursor="hand2"
+        save_p_btn = _ColorBtn(
+            p_row2, text="Save", command=self.save_current_provider,
+            font=("Segoe UI", 8, "bold"), bg="#2563eb", fg="#ffffff", abg="#1d4ed8",
+            padx=8, pady=3
         )
-        new_p_btn.pack(side="left", padx=2)
+        save_p_btn.pack(side="left", padx=(0, 6))
 
-        del_p_btn = tk.Button(
-            profile_frame, text="🗑 Delete", command=self.delete_current_provider,
-            font=("Segoe UI", 8), bg="#dc2626", fg="#ffffff", activebackground="#b91c1c", activeforeground="#ffffff",
-            relief="flat", padx=6, pady=2, cursor="hand2"
+        new_p_btn = _ColorBtn(
+            p_row2, text="+ New Provider", command=self.add_new_provider,
+            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            padx=8, pady=3
         )
-        del_p_btn.pack(side="left", padx=2)
+        new_p_btn.pack(side="left", padx=(0, 6))
+
+        del_p_btn = _ColorBtn(
+            p_row2, text="Delete", command=self.delete_current_provider,
+            font=("Segoe UI", 8), bg="#dc2626", fg="#ffffff", abg="#b91c1c",
+            padx=8, pady=3
+        )
+        del_p_btn.pack(side="left")
 
         # Get initial provider data
         cur_p_data = self.cfg.get("providers", {}).get(active_p, {})
@@ -614,10 +687,10 @@ class ClaudeBridgeApp:
         add_row.pack(fill="x", pady=(4, 0))
         self.chain_add_combo = ttk.Combobox(add_row, textvariable=self.chain_add_var, state="readonly", width=16, font=("Segoe UI", 8))
         self.chain_add_combo.pack(side="left")
-        tk.Button(
-            add_row, text="➕ Add to chain", command=self._add_chain_provider,
-            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", activebackground="#52525b", activeforeground="#ffffff",
-            relief="flat", padx=6, pady=1, cursor="hand2"
+        _ColorBtn(
+            add_row, text="+ Add to chain", command=self._add_chain_provider,
+            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            padx=6, pady=1
         ).pack(side="left", padx=(4, 0))
 
         # Live summary of what the chain means for this request's routing.
@@ -684,10 +757,10 @@ class ClaudeBridgeApp:
         )
         self.ctx_source_lbl.pack(side="left", padx=(8, 0), fill="x", expand=True)
 
-        fetch_ctx_btn = tk.Button(
-            ctx_row, text="🔄 Auto-detect", command=self.fetch_context_length,
-            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", activebackground="#52525b",
-            activeforeground="#ffffff", relief="flat", padx=8, pady=2, cursor="hand2"
+        fetch_ctx_btn = _ColorBtn(
+            ctx_row, text="Auto-detect", command=self.fetch_context_length,
+            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            padx=8, pady=2
         )
         fetch_ctx_btn.pack(side="right")
 
@@ -765,10 +838,10 @@ class ClaudeBridgeApp:
 
         tk.Label(log_head, text="Activity Log", font=("Segoe UI", 10, "bold"), bg="#27272a", fg="#60a5fa").pack(side="left")
 
-        clear_btn = tk.Button(
+        clear_btn = _ColorBtn(
             log_head, text="Clear", command=self.clear_log,
-            bg="#3f3f46", fg="#a1a1aa", activebackground="#52525b", activeforeground="#ffffff",
-            relief="flat", font=("Segoe UI", 8), padx=8, pady=1, cursor="hand2"
+            bg="#3f3f46", fg="#a1a1aa", abg="#52525b",
+            font=("Segoe UI", 8), padx=8, pady=1
         )
         clear_btn.pack(side="right")
 
@@ -800,10 +873,10 @@ class ClaudeBridgeApp:
         token_frame = tk.Frame(right_pane, bg="#27272a")
         token_frame.pack(fill="x", pady=(6, 0))
 
-        reset_tokens_btn = tk.Button(
-            token_frame, text="↺ Reset", command=self.reset_token_counter,
-            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", activebackground="#52525b",
-            activeforeground="#ffffff", relief="flat", padx=8, pady=2, cursor="hand2"
+        reset_tokens_btn = _ColorBtn(
+            token_frame, text="Reset", command=self.reset_token_counter,
+            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            padx=8, pady=2
         )
         reset_tokens_btn.pack(side="right")
 
@@ -1069,7 +1142,72 @@ class ClaudeBridgeApp:
         messagebox.showinfo("Saved", f"Provider profile '{p_name}' saved successfully!")
 
     def add_new_provider(self):
-        name = simpledialog.askstring("New Provider", "Enter a name for the new router provider (e.g. DeepSeek, Groq):")
+        """Open a custom Toplevel dialog to get the new provider name.
+        Using simpledialog.askstring can fail silently on macOS when called from
+        a widget embedded inside a Canvas (the scrollable config column)."""
+        result = {"name": None}
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("New Provider")
+        dlg.configure(bg="#18181b")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+
+        # Centre the dialog over the main window
+        self.root.update_idletasks()
+        rx = self.root.winfo_x() + self.root.winfo_width() // 2
+        ry = self.root.winfo_y() + self.root.winfo_height() // 2
+        dlg.geometry(f"380x160+{rx - 190}+{ry - 80}")
+        dlg.lift()
+        dlg.focus_force()
+
+        tk.Label(
+            dlg, text="New Provider Profile",
+            font=("Segoe UI", 11, "bold"), bg="#18181b", fg="#ffffff"
+        ).pack(pady=(16, 4))
+        tk.Label(
+            dlg, text="Enter a name (e.g. DeepSeek, Groq, My Router):",
+            font=("Segoe UI", 9), bg="#18181b", fg="#a1a1aa"
+        ).pack()
+
+        name_var = tk.StringVar()
+        entry = tk.Entry(
+            dlg, textvariable=name_var, font=("Segoe UI", 10),
+            bg="#27272a", fg="#ffffff", insertbackground="#ffffff",
+            relief="flat", highlightbackground="#3b82f6", highlightthickness=1,
+            width=32
+        )
+        entry.pack(pady=(6, 0), ipady=4)
+        entry.focus_set()
+
+        btn_row = tk.Frame(dlg, bg="#18181b")
+        btn_row.pack(pady=(10, 0))
+
+        def _confirm(event=None):
+            result["name"] = name_var.get()
+            dlg.destroy()
+
+        def _cancel(event=None):
+            dlg.destroy()
+
+        _ColorBtn(
+            btn_row, text="Create", command=_confirm,
+            font=("Segoe UI", 9, "bold"), bg="#2563eb", fg="#ffffff", abg="#1d4ed8",
+            padx=12, pady=4
+        ).pack(side="left", padx=(0, 8))
+        _ColorBtn(
+            btn_row, text="Cancel", command=_cancel,
+            font=("Segoe UI", 9), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            padx=12, pady=4
+        ).pack(side="left")
+
+        entry.bind("<Return>", _confirm)
+        entry.bind("<Escape>", _cancel)
+
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+
+        name = result["name"]
         if not name or not name.strip():
             return
         name = name.strip()
@@ -1286,15 +1424,15 @@ class ClaudeBridgeApp:
             # happens here too so the arrows/summary follow a manual rename.
             cb.bind("<<ComboboxSelected>>", lambda _e: self._on_chain_edited())
 
-            tk.Button(row, text="▲", command=lambda i=idx: self._move_chain_entry(i, -1),
-                      font=("Segoe UI", 7), bg="#3f3f46", fg="#ffffff", relief="flat",
-                      padx=4, pady=0, cursor="hand2").pack(side="left", padx=1)
-            tk.Button(row, text="▼", command=lambda i=idx: self._move_chain_entry(i, 1),
-                      font=("Segoe UI", 7), bg="#3f3f46", fg="#ffffff", relief="flat",
-                      padx=4, pady=0, cursor="hand2").pack(side="left", padx=1)
-            tk.Button(row, text="✕", command=lambda i=idx: self._remove_chain_entry(i),
-                      font=("Segoe UI", 7), bg="#3f3f46", fg="#f87171", relief="flat",
-                      padx=4, pady=0, cursor="hand2").pack(side="left", padx=1)
+            _ColorBtn(row, text="▲", command=lambda i=idx: self._move_chain_entry(i, -1),
+                      font=("Segoe UI", 7), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+                      padx=4, pady=0).pack(side="left", padx=1)
+            _ColorBtn(row, text="▼", command=lambda i=idx: self._move_chain_entry(i, 1),
+                      font=("Segoe UI", 7), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+                      padx=4, pady=0).pack(side="left", padx=1)
+            _ColorBtn(row, text="x", command=lambda i=idx: self._remove_chain_entry(i),
+                      font=("Segoe UI", 7), bg="#dc2626", fg="#ffffff", abg="#b91c1c",
+                      padx=4, pady=0).pack(side="left", padx=1)
 
         # The Add combobox only offers providers not already in the chain.
         remaining = [p for p in prov_names if p not in chain]
@@ -1465,7 +1603,7 @@ class ClaudeBridgeApp:
             self.proxy_server.start()
 
             self.status_badge.configure(text=f"● RUNNING :{port}", bg="#10b981")
-            self.start_btn.configure(text="⏹  STOP PROXY", bg="#ef4444", activebackground="#dc2626")
+            self.start_btn.configure(text="Stop Proxy", bg="#ef4444", activebackground="#dc2626", highlightbackground="#ef4444")
             self.log(f"Proxy successfully started on http://127.0.0.1:{port}")
             if cfg.get("enable_hybrid_router"):
                 chain = cfg.get("hybrid_chain") or []
@@ -1491,7 +1629,7 @@ class ClaudeBridgeApp:
             self.proxy_server = None
 
         self.status_badge.configure(text="● STOPPED", bg="#ef4444")
-        self.start_btn.configure(text="▶  START PROXY", bg="#10b981", activebackground="#059669")
+        self.start_btn.configure(text="Start Proxy", bg="#10b981", activebackground="#059669", highlightbackground="#10b981")
         self.log("Proxy stopped.")
         self._update_tray_menu(is_running=False)
 
