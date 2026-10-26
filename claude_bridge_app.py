@@ -36,7 +36,7 @@ from proxy_engine import (
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.4.7"
+APP_VERSION = "1.4.8"
 
 # Per-model reasoning effort. Claude Code no longer exposes this for custom
 # models, so the bridge injects it upstream: reasoning_effort on OpenAI-style
@@ -599,7 +599,7 @@ class ClaudeBridgeApp:
             highlightbackground="#52525b", highlightthickness=1
         )
         self.proxy_url_entry.pack(fill="x", pady=(2, 0), ipady=4)
-        ttk.Label(proxy_frame, text="If all keys 429 at once, your IP is rate-limited. Point this at a VPN/proxy (e.g. Clash/WARP local port) to egress on another IP.", style="FieldLabel.TLabel", font=("Segoe UI", 7)).pack(anchor="w", pady=(2, 0))
+        ttk.Label(proxy_frame, text="If all keys 429 at once, your IP is rate-limited. Point this at a VPN/proxy (e.g. Clash/WARP local port) to egress on another IP. Comma-separate several proxies to give each key its own IP.", style="FieldLabel.TLabel", font=("Segoe UI", 7)).pack(anchor="w", pady=(2, 0))
 
         # 3. Model & Port Row
         row_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)

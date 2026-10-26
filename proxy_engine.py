@@ -187,6 +187,22 @@ def next_untried_key(router_url, api_keys_list, tried):
     return None
 
 
+def proxy_for_key(key, api_keys_list, proxies):
+    """Egress IP paired with a key: proxy i serves key i, wrapping around.
+
+    Keys rotate on 429, so paired proxies rotate with them -- each key keeps
+    egressing from its own IP instead of every key sharing one. One proxy
+    means every key uses it (old behaviour); no proxy means direct.
+    """
+    if not proxies:
+        return ""
+    try:
+        idx = api_keys_list.index(key)
+    except ValueError:
+        idx = 0
+    return proxies[idx % len(proxies)]
+
+
 # --- Key usage telemetry (live view in the app) -------------------------------
 # Counts are taken at selection time, which is the one point every request path
 # passes through. A key swapped in by 429 rotation mid-request is not counted
@@ -1156,8 +1172,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         multi_key_enabled = cfg.get("multi_key_rotation", True)
         current_key = select_api_key(router_url, api_keys, multi_key_enabled)
         tried_keys = set()  # keys already attempted for this request (429 failover)
-        egress_proxy = (cfg.get("egress_proxy") or "").strip()
-        client = _get_anthropic_client(current_key, base_url, egress_proxy)
+        egress_proxies = parse_api_keys(cfg.get("egress_proxy"))
+        client = _get_anthropic_client(current_key, base_url, proxy_for_key(current_key, api_keys, egress_proxies))
         is_stream = anthropic_req.get("stream", True)
         # True once the 200 + SSE headers went out. An exception after that
         # point cannot send a fresh HTTP status, so the turn must be closed
@@ -1213,10 +1229,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             new_m = f"...{alt_key[-4:]}" if len(alt_key) >= 4 else "key"
                             self.emit_log(f"Key {old_m} hit limit ({resp.status_code}). Rotating to {new_m}...")
                             current_key = alt_key
-                            client = _get_anthropic_client(alt_key, base_url, egress_proxy)
+                            client = _get_anthropic_client(alt_key, base_url, proxy_for_key(alt_key, api_keys, egress_proxies))
                             tried_keys.add(alt_key)
                             return _execute_streaming(req_dict)
-                        if not egress_proxy and len(api_keys) > 1:
+                        if not egress_proxies and len(api_keys) > 1:
                             self.emit_log("Every key hit 429 - looks like an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                     if resp.status_code != 200:
@@ -1370,10 +1386,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         new_m = f"...{alt_key[-4:]}" if len(alt_key) >= 4 else "key"
                         self.emit_log(f"Key {old_m} hit limit ({status}). Failing over to next key {new_m}...")
                         current_key = alt_key
-                        client = _get_anthropic_client(alt_key, base_url, egress_proxy)
+                        client = _get_anthropic_client(alt_key, base_url, proxy_for_key(alt_key, api_keys, egress_proxies))
                         tried_keys.add(alt_key)
                         return _execute_streaming(req_dict)
-                    if not egress_proxy and len(api_keys) > 1:
+                    if not egress_proxies and len(api_keys) > 1:
                         self.emit_log("Every key hit 429 - likely an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                 # Fallback to default_model if target_model failed due to quota (402) or unavailable (404/503)
@@ -1515,10 +1531,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         new_m = f"...{alt_key[-4:]}" if len(alt_key) >= 4 else "key"
                         self.emit_log(f"Key {old_m} hit limit ({status}). Failing over to next key {new_m}...")
                         current_key = alt_key
-                        client = _get_anthropic_client(alt_key, base_url, egress_proxy)
+                        client = _get_anthropic_client(alt_key, base_url, proxy_for_key(alt_key, api_keys, egress_proxies))
                         tried_keys.add(alt_key)
                         return _execute_non_streaming(req_dict)
-                    if not egress_proxy and len(api_keys) > 1:
+                    if not egress_proxies and len(api_keys) > 1:
                         self.emit_log("Every key hit 429 - likely an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                 # Fallback to default_model if target_model failed due to quota (402) or unavailable (404/503)
@@ -1865,7 +1881,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         api_keys = parse_api_keys(api_key)
         multi_key_enabled = active_cfg.get("multi_key_rotation", True)
         current_key = select_api_key(router_url, api_keys, multi_key_enabled)
-        egress_proxy = (active_cfg.get("egress_proxy") or "").strip()
+        egress_proxies = parse_api_keys(active_cfg.get("egress_proxy"))
 
         req_headers = {
             "Content-Type": "application/json",
@@ -1886,7 +1902,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         stream_in = 0
         stream_out = 0
         try:
-            client, _is_proxied = _client_for_url(egress_proxy)
+            client, _is_proxied = _client_for_url(proxy_for_key(current_key, api_keys, egress_proxies))
             if is_stream:
                 # Stream response
                 with client.stream("POST", endpoint, headers=req_headers, json=openai_req,
@@ -1899,21 +1915,26 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                             self.emit_log(f"API key {old_m} hit limit ({resp.status_code}). Rotating to {new_m}...")
                             alt_headers = dict(req_headers)
                             alt_headers["Authorization"] = f"Bearer {alt_key}"
+                            # Each key rides its paired egress IP, so the retry
+                            # lands on a fresh (key, IP) pair, not just a new key.
+                            alt_client, _ = _client_for_url(proxy_for_key(alt_key, api_keys, egress_proxies))
                             try:
                                 resp.close()
                             except Exception:
                                 pass
-                            retry_ctx = client.stream("POST", endpoint, headers=alt_headers, json=openai_req, timeout=_stream_timeout())
+                            retry_ctx = alt_client.stream("POST", endpoint, headers=alt_headers, json=openai_req, timeout=_stream_timeout())
                             retry_resp = retry_ctx.__enter__()
                             if retry_resp.status_code == 200:
                                 resp = retry_resp
                                 current_key = alt_key
                                 req_headers = alt_headers
+                                client = alt_client
                                 break
                             elif retry_resp.status_code not in (429, 402):
                                 resp = retry_resp
                                 current_key = alt_key
                                 req_headers = alt_headers
+                                client = alt_client
                                 break
                             else:
                                 # Keep the last retry's error body for the report
@@ -1928,7 +1949,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                 except Exception:
                                     pass
                         else:
-                            if not egress_proxy:
+                            if not egress_proxies:
                                 self.emit_log("Every key hit 429 - likely an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                     if resp.status_code != 200:
@@ -2354,15 +2375,22 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         self.emit_log(f"API key {old_m} hit limit ({resp.status_code}). Rotating to {new_m}...")
                         alt_headers = dict(req_headers)
                         alt_headers["Authorization"] = f"Bearer {alt_key}"
-                        retry_resp = client.post(endpoint, headers=alt_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
+                        alt_client, _ = _client_for_url(proxy_for_key(alt_key, api_keys, egress_proxies))
+                        retry_resp = alt_client.post(endpoint, headers=alt_headers, json=openai_req, timeout=_NONSTREAM_TIMEOUT)
                         if retry_resp.status_code == 200:
                             resp = retry_resp
+                            current_key = alt_key
+                            req_headers = alt_headers
+                            client = alt_client
                             break
                         elif retry_resp.status_code not in (429, 402):
                             resp = retry_resp
+                            current_key = alt_key
+                            req_headers = alt_headers
+                            client = alt_client
                             break
                     else:
-                        if not egress_proxy:
+                        if not egress_proxies:
                             self.emit_log("Every key hit 429 - likely an IP rate limit. Set an Egress Proxy on this provider to route around it.")
 
                 if resp.status_code != 200:
