@@ -36,7 +36,7 @@ from proxy_engine import (
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.2"
 
 # Per-model reasoning effort. Claude Code no longer exposes this for custom
 # models, so the bridge injects it upstream: reasoning_effort on OpenAI-style

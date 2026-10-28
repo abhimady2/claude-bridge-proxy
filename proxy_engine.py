@@ -109,14 +109,14 @@ def _get_anthropic_client(api_key, base_url, proxy_url=None):
                     max_keepalive_connections=8,
                     max_connections=32,
                 ),
-                timeout=_sdk_httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0),
+                timeout=_sdk_httpx.Timeout(connect=5.0, read=600.0, write=60.0, pool=10.0),
             )
             _anthropic_clients[key] = anthropic.Anthropic(
                 api_key=api_key if api_key else "placeholder",
                 base_url=base_url,
                 default_headers=headers if headers else None,
                 timeout=600.0,
-                max_retries=2,
+                max_retries=0,
                 http_client=http_client,
             )
         return _anthropic_clients[key]
@@ -480,7 +480,7 @@ def _get_client():
                         max_keepalive_connections=32,
                         max_connections=128,
                     ),
-                    timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0),
+                    timeout=httpx.Timeout(connect=5.0, read=600.0, write=60.0, pool=10.0),
                 )
     return _client
 
@@ -520,7 +520,7 @@ def _client_for_url(proxy_url):
             transport=_maketransport(proxy_url),
             verify=_ssl_context(),
             limits=httpx.Limits(max_keepalive_connections=8, max_connections=32),
-            timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0),
+            timeout=httpx.Timeout(connect=5.0, read=600.0, write=60.0, pool=10.0),
         )
         with _proxy_clients_lock:
             _proxy_clients[proxy_url] = client
@@ -542,17 +542,24 @@ def close_proxy_clients():
 # and Claude Code would sit waiting for a terminal event until manually nudged.
 # This bounds the *idle* gap between chunks; a healthy long generation keeps
 # sending chunks and is unaffected.
-STREAM_IDLE_TIMEOUT = 240.0
+STREAM_IDLE_TIMEOUT = 120.0
 
 # ponytail: `read` bounds the idle gap between chunks, not total generation
 # time, so a healthy long response is unaffected -- a dead upstream releases
 # the turn in STREAM_IDLE_TIMEOUT instead of the 600s default. Built per call
 # (not a constant) so tests can retune STREAM_IDLE_TIMEOUT at runtime.
 def _stream_timeout():
-    return httpx.Timeout(connect=10.0, read=STREAM_IDLE_TIMEOUT, write=60.0, pool=10.0)
+    return httpx.Timeout(connect=5.0, read=STREAM_IDLE_TIMEOUT, write=60.0, pool=10.0)
 
 
-_NONSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
+# ponytail: read=50 -- a healthy router answers even large turns well inside
+# this (Dahl ~2s); anything slower is a stalled/queued upstream and should
+# fail over, not hold the turn hostage.
+_NONSTREAM_TIMEOUT = httpx.Timeout(connect=5.0, read=50.0, write=60.0, pool=10.0)
+
+# The anthropic SDK validates the timeout against its own httpx module, so the
+# SDK path needs the same limits built from `_sdk_httpx` instead.
+_SDK_NONSTREAM_TIMEOUT = _sdk_httpx.Timeout(connect=5.0, read=50.0, write=60.0, pool=10.0)
 
 # The hybrid fast lane (Haiku/vision routers) is for small cheap turns. A
 # compaction request carries the whole conversation as text; sending that to a
@@ -1083,7 +1090,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if self.log_callback:
             self.log_callback(text)
 
-    def _close_sse_stream(self, reason="", input_tokens=0, output_tokens=0):
+    def _close_sse_stream(self, reason="", input_tokens=0, output_tokens=0,
+                           open_blocks=None, has_tools=False,
+                           saw_delta=False, saw_stop=False):
         """Best-effort terminal SSE sequence for a stream that already sent its
         200 headers and then died mid-response. Without this Claude Code keeps
         the turn open waiting for message_stop, which is the "chat goes dead
@@ -1097,18 +1106,41 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         if reason:
             self.emit_log(reason)
         try:
-            delta = {
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                "usage": {
-                    "input_tokens": int(input_tokens or 0),
-                    "output_tokens": int(output_tokens or 0),
-                    "cache_read_input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                },
-            }
-            self.wfile.write(f"event: message_delta\ndata: {json.dumps(delta)}\n\n".encode("utf-8"))
-            self.wfile.write(b'event: message_stop\ndata: {"type": "message_stop"}\n\n')
+            # 1. Close any open content blocks cleanly before closing the message.
+            # Without closing them, Claude Code drops unclosed blocks (such as tool_use
+            # or partial text) or treats the response as malformed/empty.
+            if open_blocks:
+                for idx in sorted(open_blocks.keys()):
+                    b_type = open_blocks[idx]
+                    if b_type == "thinking":
+                        sig_evt = {
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {"type": "signature_delta", "signature": "bridge_sig"},
+                        }
+                        self.wfile.write(f"event: content_block_delta\ndata: {json.dumps(sig_evt)}\n\n".encode("utf-8"))
+                    stop_evt = {"type": "content_block_stop", "index": idx}
+                    self.wfile.write(f"event: content_block_stop\ndata: {json.dumps(stop_evt)}\n\n".encode("utf-8"))
+
+            # 2. Emit message_delta if not already emitted upstream
+            if not saw_delta:
+                stop_reason = "tool_use" if has_tools else "end_turn"
+                delta = {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {
+                        "input_tokens": int(input_tokens or 0),
+                        "output_tokens": int(output_tokens or 0),
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                }
+                self.wfile.write(f"event: message_delta\ndata: {json.dumps(delta)}\n\n".encode("utf-8"))
+
+            # 3. Emit message_stop if not already emitted upstream
+            if not saw_stop:
+                self.wfile.write(b'event: message_stop\ndata: {"type": "message_stop"}\n\n')
+
             self.wfile.flush()
         except Exception:
             pass
@@ -1249,6 +1281,10 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             # before the streaming loop starts.
             stream_in = 0
             stream_out = 0
+            open_blocks = {}
+            has_tool_use = False
+            saw_delta = False
+            saw_stop = False
             try:
                 with client.messages.with_streaming_response.create(
                         **req_dict, stream=True, timeout=STREAM_IDLE_TIMEOUT) as resp:
@@ -1292,9 +1328,158 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 
                     is_filtering_billing = False
                     ignoring_thinking = False
+                    saw_delta = False
                     saw_stop = False
+                    open_blocks = {}
+                    client_index_map = {}
+                    next_client_idx = 0
+                    has_tool_use = False
+                    chars_out = 0
                     stream_in = 0
                     stream_out = 0
+                    event_lines = []
+
+                    def flush_event(lines):
+                        nonlocal next_client_idx, has_tool_use, saw_delta, saw_stop
+                        nonlocal stream_in, stream_out, chars_out, ignoring_thinking
+                        if not lines:
+                            return
+                        data_line = None
+                        event_name = None
+                        for l in lines:
+                            if l.startswith("event:"):
+                                event_name = l[6:].strip()
+                            elif l.startswith("data:"):
+                                data_line = l[5:].strip()
+
+                        if not data_line:
+                            try:
+                                self.wfile.write(("\n".join(lines) + "\n\n").encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                pass
+                            return
+
+                        try:
+                            d = json.loads(data_line)
+                        except Exception:
+                            try:
+                                self.wfile.write(("\n".join(lines) + "\n\n").encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                pass
+                            return
+
+                        evt_type = d.get("type") or event_name
+
+                        # Extract usage
+                        u = d.get("message", {}).get("usage") or d.get("usage")
+                        if isinstance(u, dict):
+                            stream_in += u.get("input_tokens", 0) or 0
+                            stream_out += u.get("output_tokens", 0) or 0
+
+                        # Thinking strip mode handling
+                        if thinking_mode == "strip":
+                            if evt_type == "content_block_start":
+                                cb = d.get("content_block", {})
+                                if cb.get("type") == "thinking":
+                                    ignoring_thinking = True
+                                    return
+                                else:
+                                    ignoring_thinking = False
+                            elif evt_type in ("content_block_delta", "content_block_stop"):
+                                if ignoring_thinking:
+                                    if evt_type == "content_block_stop":
+                                        ignoring_thinking = False
+                                    return
+                            elif ignoring_thinking:
+                                return
+
+                        if evt_type == "content_block_start":
+                            u_idx = d.get("index", 0)
+                            c_idx = next_client_idx
+                            next_client_idx += 1
+                            client_index_map[u_idx] = c_idx
+                            cb = d.get("content_block", {})
+                            b_type = cb.get("type", "text")
+                            open_blocks[c_idx] = b_type
+                            if b_type == "tool_use":
+                                has_tool_use = True
+                            d["index"] = c_idx
+                            evt_str = f"event: content_block_start\ndata: {json.dumps(d)}\n\n"
+                            try:
+                                self.wfile.write(evt_str.encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                pass
+
+                        elif evt_type == "content_block_delta":
+                            u_idx = d.get("index", 0)
+                            c_idx = client_index_map.get(u_idx)
+                            if c_idx is None:
+                                return  # Drop orphan delta
+                            delta = d.get("delta", {})
+                            delta_type = delta.get("type", "")
+                            if delta_type == "text_delta":
+                                chars_out += len(delta.get("text", ""))
+                            elif delta_type == "input_json_delta":
+                                chars_out += len(delta.get("partial_json", ""))
+                                has_tool_use = True
+                            elif delta_type == "thinking_delta":
+                                chars_out += len(delta.get("thinking", ""))
+                            d["index"] = c_idx
+                            evt_str = f"event: content_block_delta\ndata: {json.dumps(d)}\n\n"
+                            try:
+                                self.wfile.write(evt_str.encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                pass
+
+                        elif evt_type == "content_block_stop":
+                            u_idx = d.get("index", 0)
+                            c_idx = client_index_map.get(u_idx)
+                            if c_idx is None:
+                                # Drop orphan stop (prevents IndexError in Anthropic clients)
+                                return
+                            open_blocks.pop(c_idx, None)
+                            d["index"] = c_idx
+                            evt_str = f"event: content_block_stop\ndata: {json.dumps(d)}\n\n"
+                            try:
+                                self.wfile.write(evt_str.encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                pass
+
+                        elif evt_type == "message_delta":
+                            saw_delta = True
+                            sr = d.get("delta", {}).get("stop_reason")
+                            if sr == "tool_use":
+                                has_tool_use = True
+                            evt_str = f"event: message_delta\ndata: {json.dumps(d)}\n\n"
+                            try:
+                                self.wfile.write(evt_str.encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                pass
+
+                        elif evt_type == "message_stop":
+                            saw_stop = True
+                            evt_str = b'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+                            try:
+                                self.wfile.write(evt_str)
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                pass
+
+                        else:
+                            evt_name = event_name or evt_type
+                            evt_str = f"event: {evt_name}\ndata: {json.dumps(d)}\n\n"
+                            try:
+                                self.wfile.write(evt_str.encode("utf-8"))
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                pass
+
                     # The read timeout bounds the gap between socket reads, but
                     # an upstream can hold the socket open on SSE comment lines
                     # (": keep-alive") while delivering nothing, and then the
@@ -1319,58 +1504,30 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                                 is_filtering_billing = False
                             continue
 
-                        # Anthropic-native SSE: usage arrives on message_start /
-                        # message_delta data lines.
-                        if line.startswith("data:"):
-                            try:
-                                d = json.loads(line[5:].strip())
-                                u = d.get("message", {}).get("usage") or d.get("usage")
-                                if isinstance(u, dict):
-                                    stream_in += u.get("input_tokens", 0) or 0
-                                    stream_out += u.get("output_tokens", 0) or 0
-                            except Exception:
-                                pass
+                        if not line.strip():
+                            if event_lines:
+                                flush_event(event_lines)
+                                event_lines = []
+                        else:
+                            event_lines.append(line)
 
-                        # If user requested hiding/stripping thinking
-                        if thinking_mode == "strip":
-                            if line.startswith("data:"):
-                                try:
-                                    d = json.loads(line[5:].strip())
-                                    b_type = d.get("type")
-                                    if b_type == "content_block_start":
-                                        cb = d.get("content_block", {})
-                                        if cb.get("type") == "thinking":
-                                            ignoring_thinking = True
-                                            continue
-                                        else:
-                                            ignoring_thinking = False
-                                    elif b_type in ("content_block_delta", "content_block_stop"):
-                                        if ignoring_thinking:
-                                            if b_type == "content_block_stop":
-                                                ignoring_thinking = False
-                                            continue
-                                except Exception:
-                                    pass
-                            if ignoring_thinking and line.startswith("event: content_block"):
-                                continue
+                    if event_lines:
+                        flush_event(event_lines)
 
-                        try:
-                            self.wfile.write((line + "\n").encode("utf-8"))
-                            self.wfile.flush()
-                            if line.startswith("event: message_stop"):
-                                saw_stop = True
-                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                            break
+                    if stream_out == 0 and chars_out > 0:
+                        stream_out = max(1, chars_out // 4)
                     add_tokens(stream_in, stream_out)
-                    if not saw_stop:
-                        # Upstream ended (clean close or truncation) without a
-                        # terminal event: close the turn or Claude Code waits
-                        # on a stream that will never emit message_stop.
+                    if open_blocks or not saw_stop or not saw_delta:
                         self._close_sse_stream(
                             "Upstream stream ended without message_stop; "
-                            "closing turn so Claude Code can continue.",
-                            stream_in, stream_out)
-                    self.emit_log("Response successfully streamed to Claude.")
+                            "closing turn so Claude Code can continue." if not saw_stop else "",
+                            stream_in, stream_out,
+                            open_blocks=open_blocks,
+                            has_tools=has_tool_use,
+                            saw_delta=saw_delta,
+                            saw_stop=saw_stop)
+                    self.emit_log(f"Response successfully streamed to Claude ({'Tool use' if has_tool_use else 'Text'}).")
+
 
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client closed socket prematurely
@@ -1440,7 +1597,9 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                     self._close_sse_stream(
                         f"Upstream stream failed mid-response (HTTP {status}: {err_body[:200]}); "
                         f"closing turn so Claude Code can continue.",
-                        stream_in, stream_out)
+                        stream_in, stream_out,
+                        open_blocks=open_blocks, has_tools=has_tool_use,
+                        saw_delta=saw_delta, saw_stop=saw_stop)
                     return
                 self.emit_log(f"Router Error ({status}): {err_body}")
                 try:
@@ -1464,6 +1623,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         f"Upstream stream failed mid-response ({type(ex).__name__}: {ex}); "
                         f"closing turn so Claude Code can continue.",
                         stream_in, stream_out,
+                        open_blocks=open_blocks, has_tools=has_tool_use,
+                        saw_delta=saw_delta, saw_stop=saw_stop,
                     )
                     return
                 if egress_proxies and current_proxy and proxy_attempts < len(egress_proxies):
@@ -1496,6 +1657,8 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                         f"Upstream stream failed mid-response ({type(ex).__name__}: {ex}); "
                         f"closing turn so Claude Code can continue.",
                         stream_in, stream_out,
+                        open_blocks=open_blocks, has_tools=has_tool_use,
+                        saw_delta=saw_delta, saw_stop=saw_stop,
                     )
                     return
                 self.emit_log(f"Proxy Connection Error: {_describe(ex)}")
@@ -1513,7 +1676,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         def _execute_non_streaming(req_dict):
             nonlocal client, current_key, current_proxy, proxy_attempts
             try:
-                resp = client.messages.create(**req_dict, stream=False, timeout=300.0)
+                resp = client.messages.create(**req_dict, stream=False, timeout=_SDK_NONSTREAM_TIMEOUT)
                 payload = resp.model_dump_json().encode("utf-8")
                 # resp.usage is validated SDK output, so it is trusted-shape here.
                 usage = getattr(resp, "usage", None)
