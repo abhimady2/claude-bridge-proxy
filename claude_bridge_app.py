@@ -36,7 +36,7 @@ from proxy_engine import (
 )
 
 # Bumped with every behaviour change. Shown in the title bar and logged on start.
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.6.0"
 
 # Per-model reasoning effort. Claude Code no longer exposes this for custom
 # models, so the bridge injects it upstream: reasoning_effort on OpenAI-style
@@ -53,6 +53,10 @@ def effort_key(label):
 
 def effort_label(value):
     return EFFORT_LABELS.get((value or "").strip().lower(), "Default")
+
+# UI font per platform. Tk silently falls back if the family is missing, so a
+# constant is enough -- no need to probe installed fonts.
+UI_FONT = "Helvetica Neue" if sys.platform == "darwin" else "Segoe UI"
 
 # Configuration paths
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "ClaudeBridge")
@@ -227,7 +231,7 @@ class _ColorBtn(tk.Frame):
 
     def __init__(self, parent, text="", command=None,
                  bg="#3f3f46", fg="#ffffff", abg=None,
-                 font=("Segoe UI", 9), padx=10, pady=5,
+                 font=(UI_FONT, 9), padx=10, pady=5,
                  cursor="hand2", **frame_kw):
         super().__init__(parent, bg=bg, cursor=cursor, **frame_kw)
         self._bg  = bg
@@ -331,12 +335,12 @@ class ClaudeBridgeApp:
         card_bg = "#27272a"
         text = "#f4f4f5"
 
-        self.style.configure(".", background=bg, foreground=text, font=("Segoe UI", 9))
+        self.style.configure(".", background=bg, foreground=text, font=(UI_FONT, 9))
         self.style.configure("Card.TFrame", background=card_bg, relief="flat")
-        self.style.configure("Header.TLabel", background=bg, foreground="#ffffff", font=("Segoe UI", 16, "bold"))
-        self.style.configure("SubHeader.TLabel", background=bg, foreground="#a1a1aa", font=("Segoe UI", 9))
-        self.style.configure("FieldLabel.TLabel", background=card_bg, foreground="#d4d4d8", font=("Segoe UI", 9, "bold"))
-        self.style.configure("SectionTitle.TLabel", background=card_bg, foreground="#60a5fa", font=("Segoe UI", 11, "bold"))
+        self.style.configure("Header.TLabel", background=bg, foreground="#ffffff", font=(UI_FONT, 16, "bold"))
+        self.style.configure("SubHeader.TLabel", background=bg, foreground="#a1a1aa", font=(UI_FONT, 9))
+        self.style.configure("FieldLabel.TLabel", background=card_bg, foreground="#d4d4d8", font=(UI_FONT, 9, "bold"))
+        self.style.configure("SectionTitle.TLabel", background=card_bg, foreground="#60a5fa", font=(UI_FONT, 11, "bold"))
         
         # Combobox dark style
         self.style.configure(
@@ -384,7 +388,7 @@ class ClaudeBridgeApp:
 
         self.status_badge = tk.Label(
             header_frame, text="● STOPPED",
-            font=("Segoe UI", 9, "bold"), bg="#ef4444", fg="#ffffff",
+            font=(UI_FONT, 9, "bold"), bg="#ef4444", fg="#ffffff",
             padx=10, pady=4, relief="flat"
         )
         self.status_badge.pack(side="right", pady=4)
@@ -395,35 +399,35 @@ class ClaudeBridgeApp:
 
         self.start_btn = _ColorBtn(
             toolbar, text="Start Proxy", command=self.toggle_proxy,
-            font=("Segoe UI", 10, "bold"), bg="#10b981", fg="#ffffff", abg="#059669",
+            font=(UI_FONT, 10, "bold"), bg="#10b981", fg="#ffffff", abg="#059669",
             padx=0, pady=6
         )
         self.start_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
         sync_btn = _ColorBtn(
             toolbar, text="Configure Claude Code", command=self.configure_claude_settings,
-            font=("Segoe UI", 9, "bold"), bg="#3b82f6", fg="#ffffff", abg="#2563eb",
+            font=(UI_FONT, 9, "bold"), bg="#3b82f6", fg="#ffffff", abg="#2563eb",
             padx=10, pady=6
         )
         sync_btn.pack(side="left", padx=(0, 6))
 
         restore_btn = _ColorBtn(
             toolbar, text="Restore Original", command=self.restore_claude_settings,
-            font=("Segoe UI", 9), bg="#52525b", fg="#ffffff", abg="#71717a",
+            font=(UI_FONT, 9), bg="#52525b", fg="#ffffff", abg="#71717a",
             padx=10, pady=6
         )
         restore_btn.pack(side="left", padx=(0, 6))
 
         self.tray_btn = _ColorBtn(
             toolbar, text="Minimize to Tray", command=self.minimize_to_tray,
-            font=("Segoe UI", 9), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            font=(UI_FONT, 9), bg="#3f3f46", fg="#ffffff", abg="#52525b",
             padx=10, pady=6
         )
         self.tray_btn.pack(side="left", padx=(0, 6))
 
         self.quit_btn = _ColorBtn(
             toolbar, text="Close & Exit", command=self.quit_app,
-            font=("Segoe UI", 9), bg="#dc2626", fg="#ffffff", abg="#b91c1c",
+            font=(UI_FONT, 9), bg="#dc2626", fg="#ffffff", abg="#b91c1c",
             padx=10, pady=6
         )
         self.quit_btn.pack(side="right")
@@ -493,7 +497,7 @@ class ClaudeBridgeApp:
         # Row 1: label + combobox
         p_row1 = tk.Frame(profile_frame, bg="#1e1e24")
         p_row1.pack(fill="x")
-        tk.Label(p_row1, text="Active Provider:", font=("Segoe UI", 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(side="left", padx=(0, 8))
+        tk.Label(p_row1, text="Active Provider:", font=(UI_FONT, 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(side="left", padx=(0, 8))
 
         provider_names = list(self.cfg.get("providers", {}).keys())
         active_p = self.cfg.get("active_provider")
@@ -502,7 +506,7 @@ class ClaudeBridgeApp:
 
         self.provider_var = tk.StringVar(value=active_p)
         self.provider_combo = ttk.Combobox(
-            p_row1, textvariable=self.provider_var, values=provider_names, state="readonly", width=22, font=("Segoe UI", 9)
+            p_row1, textvariable=self.provider_var, values=provider_names, state="readonly", width=22, font=(UI_FONT, 9)
         )
         self.provider_combo.pack(side="left", padx=(0, 8))
         self.provider_combo.bind("<<ComboboxSelected>>", self._on_provider_selected)
@@ -513,21 +517,21 @@ class ClaudeBridgeApp:
 
         save_p_btn = _ColorBtn(
             p_row2, text="Save", command=self.save_current_provider,
-            font=("Segoe UI", 8, "bold"), bg="#2563eb", fg="#ffffff", abg="#1d4ed8",
+            font=(UI_FONT, 8, "bold"), bg="#2563eb", fg="#ffffff", abg="#1d4ed8",
             padx=8, pady=3
         )
         save_p_btn.pack(side="left", padx=(0, 6))
 
         new_p_btn = _ColorBtn(
             p_row2, text="+ New Provider", command=self.add_new_provider,
-            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            font=(UI_FONT, 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
             padx=8, pady=3
         )
         new_p_btn.pack(side="left", padx=(0, 6))
 
         del_p_btn = _ColorBtn(
             p_row2, text="Delete", command=self.delete_current_provider,
-            font=("Segoe UI", 8), bg="#dc2626", fg="#ffffff", abg="#b91c1c",
+            font=(UI_FONT, 8), bg="#dc2626", fg="#ffffff", abg="#b91c1c",
             padx=8, pady=3
         )
         del_p_btn.pack(side="left")
@@ -541,7 +545,7 @@ class ClaudeBridgeApp:
         ttk.Label(url_frame, text="Router URL (OpenAI Base URL):", style="FieldLabel.TLabel").pack(anchor="w")
         self.url_var = tk.StringVar(value=cur_p_data.get("router_url", "https://inference.dahl.global/v1"))
         self.url_entry = tk.Entry(
-            url_frame, textvariable=self.url_var, font=("Segoe UI", 10),
+            url_frame, textvariable=self.url_var, font=(UI_FONT, 10),
             bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat", highlightbackground="#52525b", highlightthickness=1
         )
         self.url_entry.pack(fill="x", pady=(2, 0), ipady=4)
@@ -557,20 +561,20 @@ class ClaudeBridgeApp:
         self.show_key_var = tk.BooleanVar(value=False)
         show_btn = tk.Checkbutton(
             key_header, text="Show", variable=self.show_key_var, command=self._toggle_key_visibility,
-            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b", relief="flat", font=("Segoe UI", 8)
+            bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b", relief="flat", font=(UI_FONT, 8)
         )
         show_btn.pack(side="right")
 
         self.key_var = tk.StringVar(value=cur_p_data.get("api_key", ""))
         self.key_entry = tk.Entry(
-            key_frame, textvariable=self.key_var, show="•", font=("Segoe UI", 10),
+            key_frame, textvariable=self.key_var, show="•", font=(UI_FONT, 10),
             bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat", highlightbackground="#52525b", highlightthickness=1
         )
         self.key_entry.pack(fill="x", pady=(2, 0), ipady=4)
 
         # Live key-pool readout: confirms the comma-separated keys are actually
         # being picked up and rotated, rather than guessing from the masked box.
-        self.key_pool_lbl = tk.Label(key_frame, text="", font=("Segoe UI", 8), bg="#1e1e24", fg="#71717a")
+        self.key_pool_lbl = tk.Label(key_frame, text="", font=(UI_FONT, 8), bg="#1e1e24", fg="#71717a")
         self.key_pool_lbl.pack(anchor="w", pady=(2, 0))
 
         def _refresh_key_pool(*_a):
@@ -594,12 +598,12 @@ class ClaudeBridgeApp:
         ttk.Label(proxy_head, text="Egress Proxy (http://127.0.0.1:7890, socks5://127.0.0.1:1080, or empty)", style="FieldLabel.TLabel").pack(side="left", anchor="w", expand=True)
         self.proxy_url_var = tk.StringVar(value=cur_p_data.get("egress_proxy", ""))
         self.proxy_url_entry = tk.Entry(
-            proxy_frame, textvariable=self.proxy_url_var, font=("Segoe UI", 10),
+            proxy_frame, textvariable=self.proxy_url_var, font=(UI_FONT, 10),
             bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat",
             highlightbackground="#52525b", highlightthickness=1
         )
         self.proxy_url_entry.pack(fill="x", pady=(2, 0), ipady=4)
-        ttk.Label(proxy_frame, text="If all keys 429 at once, your IP is rate-limited. Point this at a VPN/proxy (e.g. Clash/WARP local port) to egress on another IP. Comma-separate several proxies to give each key its own IP.", style="FieldLabel.TLabel", font=("Segoe UI", 7)).pack(anchor="w", pady=(2, 0))
+        ttk.Label(proxy_frame, text="If all keys 429 at once, your IP is rate-limited. Point this at a VPN/proxy (e.g. Clash/WARP local port) to egress on another IP. Comma-separate several proxies to give each key its own IP.", style="FieldLabel.TLabel", font=(UI_FONT, 7)).pack(anchor="w", pady=(2, 0))
 
         # 3. Model & Port Row
         row_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
@@ -610,7 +614,7 @@ class ClaudeBridgeApp:
         ttk.Label(m_col, text="Default / Custom Model Name:", style="FieldLabel.TLabel").pack(anchor="w")
         self.model_var = tk.StringVar(value=cur_p_data.get("model", "deepseek-ai/DeepSeek-V4-Flash-0731"))
         self.model_entry = tk.Entry(
-            m_col, textvariable=self.model_var, font=("Segoe UI", 10),
+            m_col, textvariable=self.model_var, font=(UI_FONT, 10),
             bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat", highlightbackground="#52525b", highlightthickness=1
         )
         self.model_entry.pack(fill="x", pady=(2, 0), ipady=4)
@@ -626,7 +630,7 @@ class ClaudeBridgeApp:
         ttk.Label(p_col, text="Local Port:", style="FieldLabel.TLabel").pack(anchor="w")
         self.port_var = tk.IntVar(value=self.cfg.get("port", 4000))
         self.port_entry = tk.Entry(
-            p_col, textvariable=self.port_var, width=8, font=("Segoe UI", 10), justify="center",
+            p_col, textvariable=self.port_var, width=8, font=(UI_FONT, 10), justify="center",
             bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat", highlightbackground="#52525b", highlightthickness=1
         )
         self.port_entry.pack(pady=(2, 0), ipady=4)
@@ -635,31 +639,31 @@ class ClaudeBridgeApp:
         mapping_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
         mapping_frame.pack(fill="x", pady=(0, 8))
 
-        tk.Label(mapping_frame, text="Claude Code Dropdown Model Mappings:", font=("Segoe UI", 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(anchor="w", pady=(0, 4))
+        tk.Label(mapping_frame, text="Claude Code Dropdown Model Mappings:", font=(UI_FONT, 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(anchor="w", pady=(0, 4))
 
         s_row = tk.Frame(mapping_frame, bg="#1e1e24")
         s_row.pack(fill="x", pady=2)
-        tk.Label(s_row, text="Sonnet →", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
+        tk.Label(s_row, text="Sonnet →", width=9, anchor="w", font=(UI_FONT, 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
         self.sonnet_var = tk.StringVar(value=cur_p_data.get("sonnet_model", "deepseek-ai/DeepSeek-V4-Flash-0731"))
         self.sonnet_effort_var = tk.StringVar(value=effort_label(cur_p_data.get("sonnet_effort", "")))
         self._effort_combo(s_row, self.sonnet_effort_var).pack(side="right", padx=(4, 0))
-        tk.Entry(s_row, textvariable=self.sonnet_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
+        tk.Entry(s_row, textvariable=self.sonnet_var, font=(UI_FONT, 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
 
         o_row = tk.Frame(mapping_frame, bg="#1e1e24")
         o_row.pack(fill="x", pady=2)
-        tk.Label(o_row, text="Opus →", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
+        tk.Label(o_row, text="Opus →", width=9, anchor="w", font=(UI_FONT, 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
         self.opus_var = tk.StringVar(value=cur_p_data.get("opus_model", "MiniMaxAI/MiniMax-M2.7"))
         self.opus_effort_var = tk.StringVar(value=effort_label(cur_p_data.get("opus_effort", "")))
         self._effort_combo(o_row, self.opus_effort_var).pack(side="right", padx=(4, 0))
-        tk.Entry(o_row, textvariable=self.opus_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
+        tk.Entry(o_row, textvariable=self.opus_var, font=(UI_FONT, 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
 
         h_row = tk.Frame(mapping_frame, bg="#1e1e24")
         h_row.pack(fill="x", pady=2)
-        tk.Label(h_row, text="Haiku →", width=9, anchor="w", font=("Segoe UI", 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
+        tk.Label(h_row, text="Haiku →", width=9, anchor="w", font=(UI_FONT, 8, "bold"), bg="#1e1e24", fg="#d4d4d8").pack(side="left")
         self.haiku_var = tk.StringVar(value=cur_p_data.get("haiku_model", "zai-org/GLM-5.3-Flash"))
         self.haiku_effort_var = tk.StringVar(value=effort_label(cur_p_data.get("haiku_effort", "")))
         self._effort_combo(h_row, self.haiku_effort_var).pack(side="right", padx=(4, 0))
-        tk.Entry(h_row, textvariable=self.haiku_var, font=("Segoe UI", 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
+        tk.Entry(h_row, textvariable=self.haiku_var, font=(UI_FONT, 9), bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat").pack(side="left", fill="x", expand=True)
 
         # --- Hybrid Multi-Router ---
         hybrid_frame = tk.Frame(card, bg="#1e1e24", padx=10, pady=8, highlightbackground="#3f3f46", highlightthickness=1)
@@ -668,12 +672,12 @@ class ClaudeBridgeApp:
 
         h_head = tk.Frame(hybrid_frame, bg="#1e1e24")
         h_head.pack(fill="x")
-        tk.Label(h_head, text="Hybrid Multi-Router:", font=("Segoe UI", 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(side="left")
+        tk.Label(h_head, text="Hybrid Multi-Router:", font=(UI_FONT, 9, "bold"), bg="#1e1e24", fg="#60a5fa").pack(side="left")
 
         self.hybrid_var = tk.BooleanVar(value=self.cfg.get("enable_hybrid_router", False))
         tk.Checkbutton(
             h_head, text="Enable", variable=self.hybrid_var, command=self._persist_options, bg="#1e1e24", fg="#a1a1aa",
-            activebackground="#1e1e24", selectcolor="#18181b", relief="flat", font=("Segoe UI", 8)
+            activebackground="#1e1e24", selectcolor="#18181b", relief="flat", font=(UI_FONT, 8)
         ).pack(side="left", padx=(10, 0))
 
         # Ordered router chain. Heavy tasks start at router 1, fast (Haiku/vision)
@@ -685,16 +689,16 @@ class ClaudeBridgeApp:
 
         add_row = tk.Frame(hybrid_frame, bg="#1e1e24")
         add_row.pack(fill="x", pady=(4, 0))
-        self.chain_add_combo = ttk.Combobox(add_row, textvariable=self.chain_add_var, state="readonly", width=16, font=("Segoe UI", 8))
+        self.chain_add_combo = ttk.Combobox(add_row, textvariable=self.chain_add_var, state="readonly", width=16, font=(UI_FONT, 8))
         self.chain_add_combo.pack(side="left")
         _ColorBtn(
             add_row, text="+ Add to chain", command=self._add_chain_provider,
-            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            font=(UI_FONT, 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
             padx=6, pady=1
         ).pack(side="left", padx=(4, 0))
 
         # Live summary of what the chain means for this request's routing.
-        self.chain_summary_lbl = tk.Label(hybrid_frame, text="", font=("Segoe UI", 8), bg="#1e1e24", fg="#71717a", anchor="w", justify="left", wraplength=260)
+        self.chain_summary_lbl = tk.Label(hybrid_frame, text="", font=(UI_FONT, 8), bg="#1e1e24", fg="#71717a", anchor="w", justify="left", wraplength=260)
         self.chain_summary_lbl.pack(fill="x", pady=(4, 0))
 
         # Rows go last: _rebuild_chain_ui writes the Add picker and the summary.
@@ -708,19 +712,19 @@ class ClaudeBridgeApp:
         tk.Checkbutton(
             h_opts, text="Failover on error (incl. 520-524)", variable=self.hybrid_fallback_var, command=self._persist_options,
             bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b",
-            relief="flat", font=("Segoe UI", 8)
+            relief="flat", font=(UI_FONT, 8)
         ).pack(side="left")
         self.multi_key_var = tk.BooleanVar(value=self.cfg.get("multi_key_rotation", True))
         tk.Checkbutton(
             h_opts, text="Rotate API keys (all modes)", variable=self.multi_key_var, command=self._persist_options,
             bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b",
-            relief="flat", font=("Segoe UI", 8)
+            relief="flat", font=(UI_FONT, 8)
         ).pack(side="left", padx=(8, 0))
         self.strip_images_var = tk.BooleanVar(value=self.cfg.get("strip_images", False))
         tk.Checkbutton(
             h_opts, text="Strip images", variable=self.strip_images_var, command=self._persist_options,
             bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b",
-            relief="flat", font=("Segoe UI", 8)
+            relief="flat", font=(UI_FONT, 8)
         ).pack(side="left", padx=(8, 0))
 
         # Context Window (autodetected from the provider; user-editable)
@@ -736,7 +740,7 @@ class ClaudeBridgeApp:
             ctx_head, text="Auto-compact at this limit",
             variable=self.auto_ctx_var, command=self._persist_options,
             bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", selectcolor="#18181b",
-            relief="flat", font=("Segoe UI", 8)
+            relief="flat", font=(UI_FONT, 8)
         )
         auto_ctx_check.pack(side="right")
 
@@ -745,7 +749,7 @@ class ClaudeBridgeApp:
 
         self.ctx_var = tk.StringVar(value=str(self.cfg.get("context_length", DEFAULT_CONTEXT_LENGTH)))
         self.ctx_entry = tk.Entry(
-            ctx_row, textvariable=self.ctx_var, width=14, font=("Segoe UI", 10), justify="center",
+            ctx_row, textvariable=self.ctx_var, width=14, font=(UI_FONT, 10), justify="center",
             bg="#18181b", fg="#ffffff", insertbackground="#ffffff", relief="flat",
             highlightbackground="#52525b", highlightthickness=1
         )
@@ -753,13 +757,13 @@ class ClaudeBridgeApp:
         self.ctx_entry.bind("<FocusOut>", lambda e: self._normalize_ctx_entry())
 
         self.ctx_source_lbl = tk.Label(
-            ctx_row, text="", font=("Segoe UI", 8), bg="#1e1e24", fg="#71717a", wraplength=220, justify="left"
+            ctx_row, text="", font=(UI_FONT, 8), bg="#1e1e24", fg="#71717a", wraplength=220, justify="left"
         )
         self.ctx_source_lbl.pack(side="left", padx=(8, 0), fill="x", expand=True)
 
         fetch_ctx_btn = _ColorBtn(
             ctx_row, text="Auto-detect", command=self.fetch_context_length,
-            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            font=(UI_FONT, 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
             padx=8, pady=2
         )
         fetch_ctx_btn.pack(side="right")
@@ -770,7 +774,7 @@ class ClaudeBridgeApp:
         ttk.Label(t_row, text="Thinking / Reasoning:", style="FieldLabel.TLabel").pack(anchor="w")
         self.thinking_mode_var = tk.StringVar()
         self.thinking_combo = ttk.Combobox(
-            t_row, textvariable=self.thinking_mode_var, state="readonly", font=("Segoe UI", 9)
+            t_row, textvariable=self.thinking_mode_var, state="readonly", font=(UI_FONT, 9)
         )
         self.thinking_combo["values"] = [
             "Separate Thinking Block (Claude UI Collapsible)",
@@ -795,14 +799,14 @@ class ClaudeBridgeApp:
         tk.Checkbutton(
             opts_frame, text="Minimize to tray on close", variable=self.min_on_close_var, command=self._persist_options,
             bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", activeforeground="#ffffff", selectcolor="#18181b",
-            relief="flat", font=("Segoe UI", 8)
+            relief="flat", font=(UI_FONT, 8)
         ).pack(anchor="w")
 
         self.auto_start_var = tk.BooleanVar(value=self.cfg.get("auto_start", True))
         tk.Checkbutton(
             opts_frame, text="Start proxy when app launches", variable=self.auto_start_var, command=self._persist_options,
             bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", activeforeground="#ffffff", selectcolor="#18181b",
-            relief="flat", font=("Segoe UI", 8)
+            relief="flat", font=(UI_FONT, 8)
         ).pack(anchor="w")
 
         # Boot registration. "auto_start" above only covers proxy start once the
@@ -814,7 +818,7 @@ class ClaudeBridgeApp:
             opts_frame, text=f"Launch Claude Bridge when {'Windows' if sys.platform == 'win32' else 'the OS'} starts", variable=self.launch_on_boot_var,
             command=self._toggle_boot_launch,
             bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", activeforeground="#ffffff", selectcolor="#18181b",
-            relief="flat", font=("Segoe UI", 8)
+            relief="flat", font=(UI_FONT, 8)
         ).pack(anchor="w")
 
         self.boot_tray_var = tk.BooleanVar(value=self.cfg.get("boot_to_tray", True))
@@ -823,7 +827,7 @@ class ClaudeBridgeApp:
             variable=self.boot_tray_var,
             command=self._sync_boot_launch_flag,
             bg="#1e1e24", fg="#a1a1aa", activebackground="#1e1e24", activeforeground="#ffffff", selectcolor="#18181b",
-            relief="flat", font=("Segoe UI", 8)
+            relief="flat", font=(UI_FONT, 8)
         )
         # Only meaningful once boot launch is on.
         if not self.launch_on_boot_var.get():
@@ -836,12 +840,12 @@ class ClaudeBridgeApp:
         log_head = tk.Frame(right_pane, bg="#27272a")
         log_head.pack(fill="x", pady=(0, 6))
 
-        tk.Label(log_head, text="Activity Log", font=("Segoe UI", 10, "bold"), bg="#27272a", fg="#60a5fa").pack(side="left")
+        tk.Label(log_head, text="Activity Log", font=(UI_FONT, 10, "bold"), bg="#27272a", fg="#60a5fa").pack(side="left")
 
         clear_btn = _ColorBtn(
             log_head, text="Clear", command=self.clear_log,
             bg="#3f3f46", fg="#a1a1aa", abg="#52525b",
-            font=("Segoe UI", 8), padx=8, pady=1
+            font=(UI_FONT, 8), padx=8, pady=1
         )
         clear_btn.pack(side="right")
 
@@ -850,10 +854,10 @@ class ClaudeBridgeApp:
         tk.Checkbutton(
             log_head, text="Auto-scroll", variable=self.auto_scroll_var,
             bg="#27272a", fg="#a1a1aa", activebackground="#27272a", selectcolor="#18181b",
-            relief="flat", font=("Segoe UI", 8)
+            relief="flat", font=(UI_FONT, 8)
         ).pack(side="right", padx=(0, 8))
 
-        self.log_status_lbl = tk.Label(log_head, text="", font=("Segoe UI", 8), bg="#27272a", fg="#71717a", anchor="e")
+        self.log_status_lbl = tk.Label(log_head, text="", font=(UI_FONT, 8), bg="#27272a", fg="#71717a", anchor="e")
         self.log_status_lbl.pack(side="right", padx=(0, 8), fill="x", expand=True)
 
         self.log_area = scrolledtext.ScrolledText(
@@ -875,17 +879,17 @@ class ClaudeBridgeApp:
 
         reset_tokens_btn = _ColorBtn(
             token_frame, text="Reset", command=self.reset_token_counter,
-            font=("Segoe UI", 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            font=(UI_FONT, 8), bg="#3f3f46", fg="#ffffff", abg="#52525b",
             padx=8, pady=2
         )
         reset_tokens_btn.pack(side="right")
 
         tk.Label(
-            token_frame, text="Tokens:", font=("Segoe UI", 9, "bold"), bg="#27272a", fg="#60a5fa"
+            token_frame, text="Tokens:", font=(UI_FONT, 9, "bold"), bg="#27272a", fg="#60a5fa"
         ).pack(side="left", padx=(0, 8))
 
         self.token_display = tk.Label(
-            token_frame, text="↑ 0 · ↓ 0 · Σ 0 · 0 reqs", font=("Segoe UI", 9),
+            token_frame, text="↑ 0 · ↓ 0 · Σ 0 · 0 reqs", font=(UI_FONT, 9),
             bg="#27272a", fg="#d4d4d8"
         )
         self.token_display.pack(side="left")
@@ -895,7 +899,7 @@ class ClaudeBridgeApp:
         key_frame = tk.Frame(right_pane, bg="#27272a")
         key_frame.pack(fill="x", pady=(4, 0))
         tk.Label(
-            key_frame, text="Keys:", font=("Segoe UI", 9, "bold"), bg="#27272a", fg="#60a5fa"
+            key_frame, text="Keys:", font=(UI_FONT, 9, "bold"), bg="#27272a", fg="#60a5fa"
         ).pack(side="left", padx=(0, 8))
         self.key_display = tk.Label(
             key_frame, text="no requests yet", font=("Consolas", 8),
@@ -1053,7 +1057,7 @@ class ClaudeBridgeApp:
     def _effort_combo(self, parent, var, width=8):
         cb = ttk.Combobox(
             parent, textvariable=var, values=EFFORT_LEVELS,
-            state="readonly", width=width, font=("Segoe UI", 8)
+            state="readonly", width=width, font=(UI_FONT, 8)
         )
         cb.bind("<<ComboboxSelected>>", self._on_effort_changed)
         return cb
@@ -1163,16 +1167,16 @@ class ClaudeBridgeApp:
 
         tk.Label(
             dlg, text="New Provider Profile",
-            font=("Segoe UI", 11, "bold"), bg="#18181b", fg="#ffffff"
+            font=(UI_FONT, 11, "bold"), bg="#18181b", fg="#ffffff"
         ).pack(pady=(16, 4))
         tk.Label(
             dlg, text="Enter a name (e.g. DeepSeek, Groq, My Router):",
-            font=("Segoe UI", 9), bg="#18181b", fg="#a1a1aa"
+            font=(UI_FONT, 9), bg="#18181b", fg="#a1a1aa"
         ).pack()
 
         name_var = tk.StringVar()
         entry = tk.Entry(
-            dlg, textvariable=name_var, font=("Segoe UI", 10),
+            dlg, textvariable=name_var, font=(UI_FONT, 10),
             bg="#27272a", fg="#ffffff", insertbackground="#ffffff",
             relief="flat", highlightbackground="#3b82f6", highlightthickness=1,
             width=32
@@ -1192,12 +1196,12 @@ class ClaudeBridgeApp:
 
         _ColorBtn(
             btn_row, text="Create", command=_confirm,
-            font=("Segoe UI", 9, "bold"), bg="#2563eb", fg="#ffffff", abg="#1d4ed8",
+            font=(UI_FONT, 9, "bold"), bg="#2563eb", fg="#ffffff", abg="#1d4ed8",
             padx=12, pady=4
         ).pack(side="left", padx=(0, 8))
         _ColorBtn(
             btn_row, text="Cancel", command=_cancel,
-            font=("Segoe UI", 9), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+            font=(UI_FONT, 9), bg="#3f3f46", fg="#ffffff", abg="#52525b",
             padx=12, pady=4
         ).pack(side="left")
 
@@ -1341,6 +1345,7 @@ class ClaudeBridgeApp:
 <plist version="1.0">
 <dict>
     <key>Label</key><string>com.claudebridge.app</string>
+    <key>ProcessType</key><string>Interactive</string>
     <key>ProgramArguments</key>
     <array>
 {''.join(f'        <string>{a}</string>\n' for a in args)}    </array>
@@ -1413,25 +1418,25 @@ class ClaudeBridgeApp:
             row.pack(fill="x", pady=(2, 0))
             self._chain_rows.append(row)
 
-            tk.Label(row, text=f"{idx + 1}.", width=3, anchor="w", font=("Segoe UI", 8, "bold"),
+            tk.Label(row, text=f"{idx + 1}.", width=3, anchor="w", font=(UI_FONT, 8, "bold"),
                      bg="#1e1e24", fg="#71717a").pack(side="left")
             var = tk.StringVar(value=name)
             self._chain_vars.append(var)
             cb = ttk.Combobox(row, textvariable=var, values=prov_names, state="readonly",
-                              width=14, font=("Segoe UI", 8))
+                              width=14, font=(UI_FONT, 8))
             cb.pack(side="left", padx=(0, 4))
             # ttk has no command=; selection is the persistence hook. Rebuilding
             # happens here too so the arrows/summary follow a manual rename.
             cb.bind("<<ComboboxSelected>>", lambda _e: self._on_chain_edited())
 
             _ColorBtn(row, text="▲", command=lambda i=idx: self._move_chain_entry(i, -1),
-                      font=("Segoe UI", 7), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+                      font=(UI_FONT, 7), bg="#3f3f46", fg="#ffffff", abg="#52525b",
                       padx=4, pady=0).pack(side="left", padx=1)
             _ColorBtn(row, text="▼", command=lambda i=idx: self._move_chain_entry(i, 1),
-                      font=("Segoe UI", 7), bg="#3f3f46", fg="#ffffff", abg="#52525b",
+                      font=(UI_FONT, 7), bg="#3f3f46", fg="#ffffff", abg="#52525b",
                       padx=4, pady=0).pack(side="left", padx=1)
             _ColorBtn(row, text="x", command=lambda i=idx: self._remove_chain_entry(i),
-                      font=("Segoe UI", 7), bg="#dc2626", fg="#ffffff", abg="#b91c1c",
+                      font=(UI_FONT, 7), bg="#dc2626", fg="#ffffff", abg="#b91c1c",
                       padx=4, pady=0).pack(side="left", padx=1)
 
         # The Add combobox only offers providers not already in the chain.

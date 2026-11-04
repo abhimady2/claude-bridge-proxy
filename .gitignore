@@ -27,6 +27,9 @@ ENV/
 .vscode/
 .idea/
 
+# Browser automation artifacts
+.playwright-mcp/
+
 # Local test files & scratch
 test_*.py
 check_keys.py

@@ -62,7 +62,7 @@ pyinstaller ClaudeBridge.spec
 
 This produces `dist\ClaudeBridge.exe` — a single self-contained executable with the logo, icon, and all assets bundled. Distribute it anywhere; no Python installation needed.
 
-The `.spec` file controls the build — icon, hidden imports (`pystray._win32`, `anthropic`, `PIL.ImageTk`), and asset bundling. Edit the spec rather than passing CLI flags.
+The `.spec` file controls the build — icon, hidden imports (the platform's `pystray` backend, `anthropic`, `PIL.ImageTk`), and asset bundling. Edit the spec rather than passing CLI flags.
 
 ## 🍎 macOS
 
@@ -89,8 +89,7 @@ python3 claude_bridge_app.py
 - **Config location:** `~/ClaudeBridge/config.json` (Windows: `%APPDATA%\ClaudeBridge`)
 - **Launch at login:** writes a LaunchAgent to `~/Library/LaunchAgents/com.claudebridge.app.plist` — the same checkbox that uses the Run key on Windows. To manage manually, run `launchctl load|unload ~/Library/LaunchAgents/com.claudebridge.app.plist`.
 - **Tray icon:** pystray renders in the macOS menu bar.
-- **Window icon:** the `.ico` is a Windows format; macOS ignores it harmlessly.
-- To build a `.app` bundle: `pyinstaller ClaudeBridge.spec` produces a windowed binary, though for a signed `.app` you'd wrap it with `py2app` and notarize it yourself — out of scope here.
+- **Building the app:** `pyinstaller ClaudeBridge.spec` produces `dist/ClaudeBridge.app` — a one-dir bundle with the tray backend and pyobjc wired in. For a signed, notarized `.app` you'd codesign it yourself — out of scope here.
 
 ## ⚡ Connecting Claude Code
 
